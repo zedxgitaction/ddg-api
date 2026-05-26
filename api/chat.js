@@ -1,15 +1,14 @@
-// Vercel Serverless Function: DDG AI Chat API (Full Proxy)
+// Vercel Serverless Function: DDG AI Chat API
 //
-// POST /api/chat        { "message": "hello" }        → triggers GH Actions proxy, returns { request_id }
-// POST /api/chat/result { "id": "xxx" }                → polls Redis for result
-//
-// GH Actions (CloakBrowser) handles the actual DDG request to bypass IP blocking.
+// POST /api/chat          { "message": "hello" }                          → triggers chat, returns { request_id }
+// POST /api/chat/result   { "id": "xxx" }                                 → polls Redis for chat result
+// POST /api/edit          { "image_url": "url", "prompt": "edit this" }   → triggers image edit, returns { request_id }
+// POST /api/edit/result   { "id": "xxx" }                                 → polls Redis for edit result
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const GH_PAT = process.env.GH_PAT;
 const GH_REPO = "zade911786/ddg-api";
-const GH_WORKFLOW = "proxy-chat.yml";
 
 function randomId() {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -52,9 +51,9 @@ async function redisGet(key) {
   }
 }
 
-async function triggerWorkflow(message, requestId) {
+async function triggerWorkflow(workflow, inputs) {
   const r = await fetch(
-    `https://api.github.com/repos/${GH_REPO}/actions/workflows/${GH_WORKFLOW}/dispatches`,
+    `https://api.github.com/repos/${GH_REPO}/actions/workflows/${workflow}/dispatches`,
     {
       method: "POST",
       headers: {
@@ -64,7 +63,7 @@ async function triggerWorkflow(message, requestId) {
       },
       body: JSON.stringify({
         ref: "master",
-        inputs: { message, request_id: requestId },
+        inputs,
       }),
     }
   );
@@ -85,9 +84,63 @@ export default async function handler(req, res) {
   }
 
   const body = parseBody(req);
+  const url = req.url || "";
 
-  // Poll for result: POST /api/chat/result { "id": "xxx" }
-  if (req.url.includes("/result")) {
+  // ============ IMAGE EDIT ENDPOINTS ============
+
+  // Poll edit result: POST /api/edit/result { "id": "xxx" }
+  if (url.includes("/edit/result")) {
+    const id = body.id;
+    if (!id) {
+      return res.status(400).json({ error: 'Missing "id" in request body' });
+    }
+    const data = await redisGet(`edit:${id}`);
+    if (!data) {
+      return res.status(200).json({
+        status: "waiting",
+        message: "Edit request still processing or expired. GH Actions takes ~30-60s.",
+      });
+    }
+    return res.status(200).json(data);
+  }
+
+  // Trigger edit: POST /api/edit { "image_url": "url", "prompt": "edit this" }
+  if (url.includes("/edit")) {
+    const imageUrl = body.image_url;
+    const prompt = body.prompt;
+    if (!imageUrl) {
+      return res.status(400).json({ error: 'Missing "image_url" in request body' });
+    }
+    if (!prompt) {
+      return res.status(400).json({ error: 'Missing "prompt" in request body' });
+    }
+    if (!GH_PAT) {
+      return res.status(500).json({ error: "GH_PAT not configured" });
+    }
+
+    const requestId = randomId();
+    await redisSet(`edit:${requestId}`, { status: "queued" }, 180);
+
+    const triggered = await triggerWorkflow("proxy-edit.yml", {
+      image_url: imageUrl,
+      edit_prompt: prompt,
+      request_id: requestId,
+    });
+    if (!triggered) {
+      return res.status(500).json({ error: "Failed to trigger image edit workflow" });
+    }
+
+    return res.status(200).json({
+      status: "triggered",
+      request_id: requestId,
+      note: "POST to /api/edit/result with { \"id\": \"<request_id>\" } to get the edited image.",
+    });
+  }
+
+  // ============ CHAT ENDPOINTS ============
+
+  // Poll chat result: POST /api/chat/result { "id": "xxx" }
+  if (url.includes("/result")) {
     const id = body.id;
     if (!id) {
       return res.status(400).json({ error: 'Missing "id" in request body' });
@@ -104,7 +157,7 @@ export default async function handler(req, res) {
     return res.status(200).json(data);
   }
 
-  // Trigger: POST /api/chat { "message": "hello" }
+  // Trigger chat: POST /api/chat { "message": "hello" }
   const msg = body.message;
   if (!msg) {
     return res.status(400).json({ error: 'Missing "message" in request body' });
@@ -115,10 +168,12 @@ export default async function handler(req, res) {
   }
 
   const requestId = randomId();
-
   await redisSet(`chat:${requestId}`, { status: "queued" }, 180);
 
-  const triggered = await triggerWorkflow(msg, requestId);
+  const triggered = await triggerWorkflow("proxy-chat.yml", {
+    message: msg,
+    request_id: requestId,
+  });
   if (!triggered) {
     return res.status(500).json({ error: "Failed to trigger GH Actions workflow" });
   }
