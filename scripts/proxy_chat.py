@@ -109,17 +109,55 @@ def capture_headers():
     cookies_list = page.context.cookies()
     print(f"[+] Captured {len(cookies_list)} cookies")
 
-    # Extract fe-version from page HTML if not captured
+    # Extract fe-version from page JS/HTML if not captured from request headers
     if "x-fe-version" not in captured:
         try:
             html = page.content()
             import re
-            match = re.search(r'serp_\d{8}_\d{6}_ET-[a-f0-9]+', html)
-            if match:
-                captured["x-fe-version"] = match.group(0)
-                print(f"[+] Extracted fe-version from HTML")
+            # Try multiple patterns
+            patterns = [
+                r'serp_\d{8}_\d{6}_ET-[a-f0-9]+',
+                r'["\']x-fe-version["\']\s*:\s*["\']([^"\']+)["\']',
+                r'feVersion["\s:=]+["\']([^"\']+)',
+                r'FE_VERSION["\s:=]+["\']([^"\']+)',
+            ]
+            for pat in patterns:
+                match = re.search(pat, html)
+                if match:
+                    val = match.group(1) if match.lastindex else match.group(0)
+                    captured["x-fe-version"] = val
+                    print(f"[+] Extracted fe-version from HTML: {val[:50]}")
+                    break
         except Exception as e:
             print(f"[*] HTML extraction failed: {e}")
+
+    # Also try extracting from JS bundle scripts via page evaluation
+    if "x-fe-version" not in captured:
+        try:
+            # Look for the version string in all script tags
+            scripts = page.evaluate("""
+                () => {
+                    const scripts = document.querySelectorAll('script[src]');
+                    return Array.from(scripts).map(s => s.src);
+                }
+            """)
+            print(f"[*] Found {len(scripts)} script sources")
+            for src in scripts:
+                if 'chunk' in src or 'app' in src or 'main' in src:
+                    try:
+                        resp = requests.get(src, timeout=10)
+                        match = re.search(r'serp_\d{8}_\d{6}_ET-[a-f0-9]+', resp.text)
+                        if match:
+                            captured["x-fe-version"] = match.group(0)
+                            print(f"[+] Extracted fe-version from JS bundle: {match.group(0)[:50]}")
+                            break
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[*] JS bundle extraction failed: {e}")
+
+    if "x-fe-version" not in captured:
+        print("[!] WARNING: x-fe-version not found - will try chat without it")
 
     browser.close()
 
@@ -139,9 +177,9 @@ def capture_headers():
 
 def send_chat(message):
     """Send chat request to DDG using captured headers."""
-    if not captured.get("x-vqd-hash-1") or not captured.get("x-fe-version"):
-        print("[!] Missing required headers")
-        return {"error": "Missing required headers", "have": list(captured.keys())}
+    if not captured.get("x-vqd-hash-1"):
+        print("[!] Missing required header: x-vqd-hash-1")
+        return {"error": "Missing x-vqd-hash-1", "have": list(captured.keys())}
 
     cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies_list) if cookies_list else ""
 
@@ -171,12 +209,13 @@ def send_chat(message):
         "Content-Type": "application/json",
         "accept": "text/event-stream",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-        "x-fe-version": captured["x-fe-version"],
         "x-fe-signals": fe_signals,
         "x-ddg-journey-id": uuid.uuid4().hex,
         "Origin": "https://duck.ai",
         "Referer": "https://duck.ai/",
     }
+    if captured.get("x-fe-version"):
+        headers["x-fe-version"] = captured["x-fe-version"]
     if cookie_str:
         headers["Cookie"] = cookie_str
 
