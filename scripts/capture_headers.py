@@ -49,18 +49,24 @@ def upload_to_redis(headers_dict):
         print("[!] UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN not set")
         return False
 
+    data = json.dumps(headers_dict)
+    # Upstash REST: POST /pipeline with ["SET", "key", "value", "EX", ttl]
     r = requests.post(
-        f"{UPSTASH_URL}/set/ddg_headers",
+        f"{UPSTASH_URL}/pipeline",
         headers={
             "Authorization": f"Bearer {UPSTASH_TOKEN}",
             "Content-Type": "application/json",
         },
-        json=[json.dumps(headers_dict), "EX", 240],
+        json=[["SET", "ddg_headers", data, "EX", 240]],
         timeout=10,
     )
     if r.status_code == 200:
-        print(f"[+] Uploaded headers to Redis (TTL=240s)")
-        return True
+        result = r.json()
+        if result and result[0].get("result") == "OK":
+            print(f"[+] Uploaded headers to Redis (TTL=240s)")
+            return True
+        print(f"[!] Unexpected Redis response: {r.text}")
+        return False
     else:
         print(f"[!] Redis upload failed: {r.status_code} {r.text}")
         return False
