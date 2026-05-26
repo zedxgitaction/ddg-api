@@ -227,38 +227,35 @@ def send_chat(message):
 
     if not ddg_res.ok:
         err_text = ddg_res.text[:500]
-        print(f"[!] DDG returned {ddg_res.status}: {err_text}")
+        print(f"[!] DDG returned {ddg_res.status_code}: {err_text}")
         return {
-            "error": f"DDG returned {ddg_res.status}",
+            "error": f"DDG returned {ddg_res.status_code}",
             "detail": err_text,
-            "status_code": ddg_res.status,
+            "status_code": ddg_res.status_code,
         }
 
-    # Parse SSE response
+    # Read streamed SSE response
     full_text = ""
-    raw = ddg_res.text
-    for line in raw.split("\n"):
-        if not line.startswith("data: ") or "[DONE]" in line:
+    for line in ddg_res.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: ") or "[DONE]" in line:
             continue
+        data = line[6:]
         try:
-            j = json.loads(line[6:])
+            j = json.loads(data)
+            # Try message field first (streaming format)
             if j.get("message"):
                 full_text += j["message"]
+            # Try messages[0].parts[0].text (complete format)
+            elif not full_text:
+                try:
+                    parts = j.get("messages", [{}])[0].get("parts", [])
+                    for p in parts:
+                        if p.get("text"):
+                            full_text += p["text"]
+                except (IndexError, KeyError):
+                    pass
         except json.JSONDecodeError:
             pass
-
-    if not full_text:
-        for line in raw.split("\n"):
-            if not line.startswith("data: ") or "[DONE]" in line:
-                continue
-            try:
-                j = json.loads(line[6:])
-                parts = j.get("messages", [{}])[0].get("parts", [])
-                for p in parts:
-                    if p.get("text"):
-                        full_text += p["text"]
-            except (json.JSONDecodeError, IndexError, KeyError):
-                pass
 
     result = full_text.strip() or "No response text extracted"
     print(f"[+] Got response: {result[:80]}...")
