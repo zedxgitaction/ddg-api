@@ -653,6 +653,21 @@ def send_edit_via_browser(image_url, edit_prompt):
             else:
                 return {"status": "timeout", "error": "No reply received within 120s", "text": clean}
 
+    # Fallback: take screenshot of the page
+    print("[!] No images/text found — taking screenshot as fallback")
+    try:
+        screenshot_bytes = page.screenshot(type="png", full_page=True)
+        if screenshot_bytes and len(screenshot_bytes) > 5000:
+            url = upload_to_tmpfiles(screenshot_bytes, "ddg_edit_screenshot.png")
+            if url:
+                result["images"] = [url]
+                result["type"] = "screenshot"
+                result["note"] = "duck.ai did not generate an edited image. This is a screenshot of the conversation."
+                browser.close()
+                return result
+    except Exception as e:
+        print(f"[!] Screenshot failed: {e}")
+
     browser.close()
     result["error"] = "No edited images generated"
     return result
@@ -746,8 +761,6 @@ def handle_reply(request_id, reply_message, proxy_url, original_image_url):
                 print(f"[*] No images after {timeout}s")
                 break
 
-    browser.close()
-
     result = {"status": "success", "type": "image", "proxy": proxy_url[:40]}
 
     if got_images:
@@ -756,11 +769,28 @@ def handle_reply(request_id, reply_message, proxy_url, original_image_url):
             tmp_urls = upload_dom_images(final_dom_images, pre_existing_urls)
         if tmp_urls:
             result["images"] = tmp_urls
+            browser.close()
+            return result
         else:
             result["error"] = "Images found but upload failed"
     else:
+        # Fallback: take screenshot
+        print("[!] No images after reply — taking screenshot as fallback")
+        try:
+            screenshot_bytes = page.screenshot(type="png", full_page=True)
+            if screenshot_bytes and len(screenshot_bytes) > 5000:
+                url = upload_to_tmpfiles(screenshot_bytes, "ddg_edit_screenshot.png")
+                if url:
+                    result["images"] = [url]
+                    result["type"] = "screenshot"
+                    result["note"] = "duck.ai did not generate an edited image after reply. This is a screenshot of the conversation."
+                    browser.close()
+                    return result
+        except Exception as e:
+            print(f"[!] Screenshot failed: {e}")
         result["error"] = "No images generated after reply"
 
+    browser.close()
     return result
 
 

@@ -527,6 +527,22 @@ def send_chat_via_browser(message):
             browser.close()
             return result
 
+    # Fallback: take screenshot of the page
+    if img_request:
+        print("[!] No images/text found — taking screenshot as fallback")
+        try:
+            screenshot_bytes = page.screenshot(type="png", full_page=True)
+            if screenshot_bytes and len(screenshot_bytes) > 5000:
+                url = upload_to_tmpfiles(screenshot_bytes, "ddg_image_screenshot.png")
+                if url:
+                    result["images"] = [url]
+                    result["type"] = "screenshot"
+                    result["note"] = "duck.ai did not generate an image. This is a screenshot of the conversation."
+                    browser.close()
+                    return result
+        except Exception as e:
+            print(f"[!] Screenshot failed: {e}")
+
     browser.close()
     result["error"] = "No response from duck.ai"
     return result
@@ -611,8 +627,6 @@ def handle_reply(request_id, reply_message, proxy_url, img_request):
                 print(f"[*] No images after {timeout}s")
                 break
 
-    browser.close()
-
     result = {"status": "success", "model": "gpt-5-mini", "proxy": proxy_url[:40]}
 
     if got_images:
@@ -622,11 +636,28 @@ def handle_reply(request_id, reply_message, proxy_url, img_request):
         if tmp_urls:
             result["images"] = tmp_urls
             result["type"] = "image"
+            browser.close()
+            return result
         else:
             result["error"] = "Images found but upload failed"
     else:
+        # Fallback: take screenshot
+        print("[!] No images after reply — taking screenshot as fallback")
+        try:
+            screenshot_bytes = page.screenshot(type="png", full_page=True)
+            if screenshot_bytes and len(screenshot_bytes) > 5000:
+                url = upload_to_tmpfiles(screenshot_bytes, "ddg_image_screenshot.png")
+                if url:
+                    result["images"] = [url]
+                    result["type"] = "screenshot"
+                    result["note"] = "duck.ai did not generate an image after reply. This is a screenshot of the conversation."
+                    browser.close()
+                    return result
+        except Exception as e:
+            print(f"[!] Screenshot failed: {e}")
         result["error"] = "No images generated after reply"
 
+    browser.close()
     return result
 
 
