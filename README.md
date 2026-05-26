@@ -32,7 +32,7 @@ POST /api/chat/result  -->  Reads from Redis  -->  Returns JSON
 
 ## API Endpoints
 
-### 1. Trigger Request
+### 1. Chat — Trigger
 
 ```
 POST https://ddg-api-iota.vercel.app/api/chat
@@ -50,7 +50,7 @@ Content-Type: application/json
 }
 ```
 
-### 2. Poll for Result
+### 2. Chat — Poll for Result
 
 ```
 POST https://ddg-api-iota.vercel.app/api/chat/result
@@ -65,7 +65,8 @@ Content-Type: application/json
     "status": "done",
     "model": "gpt-5-mini",
     "response": "Here is the answer...",
-    "type": "text"
+    "type": "text",
+    "proxy": "px043005.pointtoserver.com:10780"
 }
 ```
 
@@ -76,11 +77,54 @@ Content-Type: application/json
     "model": "gpt-5-mini",
     "response": "GPT Image 2\n. .",
     "images": ["https://tmpfiles.org/dl/xxxx/ddg_image_0.jpg"],
-    "type": "image"
+    "type": "image",
+    "proxy": "px043005.pointtoserver.com:10780"
 }
 ```
 
-**Other statuses:** `processing` | `waiting` | `not_found` | `error`
+### 3. Image Edit — Trigger
+
+```
+POST https://ddg-api-iota.vercel.app/api/edit
+Content-Type: application/json
+
+{
+    "image_url": "https://example.com/cat.jpg",
+    "prompt": "make the cat wear sunglasses"
+}
+```
+
+**Response:**
+```json
+{
+    "status": "triggered",
+    "request_id": "abc123def456",
+    "note": "POST to /api/edit/result with { \"id\": \"<request_id>\" } to get the edited image."
+}
+```
+
+### 4. Image Edit — Poll for Result
+
+```
+POST https://ddg-api-iota.vercel.app/api/edit/result
+Content-Type: application/json
+
+{"id": "abc123def456"}
+```
+
+**Response:**
+```json
+{
+    "status": "done",
+    "model": "gpt-5-mini",
+    "response": "Here is the edited image...",
+    "images": ["https://tmpfiles.org/dl/xxxx/ddg_edit_0.jpg"],
+    "type": "image",
+    "proxy": "px031901.pointtoserver.com:10780"
+}
+```
+
+**All endpoints return:** `processing` | `waiting` | `done` | `not_found` | `error`
 
 ## Quick Start (Python)
 
@@ -89,35 +133,39 @@ import requests, time
 
 BASE = "https://ddg-api-iota.vercel.app/api"
 
-def ask_ddg(message, max_wait=90):
-    # Step 1: Trigger
-    r = requests.post(f"{BASE}/chat", json={"message": message})
-    data = r.json()
-    if data.get("status") != "triggered":
-        return {"error": data.get("message", "Trigger failed")}
-
-    request_id = data["request_id"]
-
-    # Step 2: Poll
+def poll_result(endpoint, request_id, max_wait=90):
     elapsed = 0
     while elapsed < max_wait:
         time.sleep(8)
         elapsed += 8
-        r = requests.post(f"{BASE}/chat/result", json={"id": request_id})
+        r = requests.post(f"{BASE}/{endpoint}/result", json={"id": request_id})
         result = r.json()
         if result["status"] == "done":
             return result
         if result["status"] == "not_found":
             return {"error": "Request expired"}
-
     return {"error": "Timeout"}
 
-# Text chat
-result = ask_ddg("What is Python?")
+# --- Chat: Text ---
+r = requests.post(f"{BASE}/chat", json={"message": "What is Python?"})
+data = r.json()
+result = poll_result("chat", data["request_id"])
 print(result["response"])
 
-# Image generation
-result = ask_ddg("generate an image of a cat")
+# --- Chat: Image generation ---
+r = requests.post(f"{BASE}/chat", json={"message": "generate an image of a cat"})
+data = r.json()
+result = poll_result("chat", data["request_id"])
+if result.get("images"):
+    print(result["images"][0])
+
+# --- Image Editing ---
+r = requests.post(f"{BASE}/edit", json={
+    "image_url": "https://example.com/cat.jpg",
+    "prompt": "make the cat wear sunglasses"
+})
+data = r.json()
+result = poll_result("edit", data["request_id"])
 if result.get("images"):
     print(result["images"][0])
 ```
@@ -125,13 +173,25 @@ if result.get("images"):
 ## Quick Start (curl)
 
 ```bash
-# Step 1: Trigger
+# --- Chat ---
+# Trigger
 curl -X POST "https://ddg-api-iota.vercel.app/api/chat" \
   -H "Content-Type: application/json" \
   -d '{"message": "hello"}'
 
-# Step 2: Poll (use the request_id from step 1)
+# Poll (use the request_id from trigger)
 curl -X POST "https://ddg-api-iota.vercel.app/api/chat/result" \
+  -H "Content-Type: application/json" \
+  -d '{"id": "YOUR_REQUEST_ID"}'
+
+# --- Image Edit ---
+# Trigger
+curl -X POST "https://ddg-api-iota.vercel.app/api/edit" \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://example.com/cat.jpg", "prompt": "add sunglasses"}'
+
+# Poll
+curl -X POST "https://ddg-api-iota.vercel.app/api/edit/result" \
   -H "Content-Type: application/json" \
   -d '{"id": "YOUR_REQUEST_ID"}'
 ```
@@ -148,6 +208,17 @@ curl -X POST "https://ddg-api-iota.vercel.app/api/chat/result" \
 | gpt-oss-120b | Open-source |
 | GPT Image 2 | OpenAI (image gen) |
 
+## Proxy Rotation
+
+All requests go through rotating proxies for anti-detection. 5 proxies are used randomly per request:
+
+| Proxy | Type |
+|-------|------|
+| px043005.pointtoserver.com:10780 | PureVPN (2 accounts) |
+| px031901.pointtoserver.com:10780 | PureVPN |
+| p101.squidproxies.com:9088 | SquidProxies |
+| 136.179.19.164:3128 | Residential |
+
 ## Timing
 
 | Type | Time |
@@ -155,6 +226,7 @@ curl -X POST "https://ddg-api-iota.vercel.app/api/chat/result" \
 | GH Actions startup | ~14s |
 | Text response | ~20-25s |
 | Image generation | ~25-45s |
+| Image editing | ~30-50s |
 
 **Polling strategy:** Wait 20s after trigger, then poll every 8s. Max 90s.
 
@@ -163,16 +235,19 @@ curl -X POST "https://ddg-api-iota.vercel.app/api/chat/result" \
 ```
 ddg-api/
 ├── api/
-│   └── chat.js              # Vercel serverless function (trigger + result)
+│   └── chat.js              # Vercel serverless function (chat + edit endpoints)
 ├── scripts/
-│   └── proxy_chat.py        # CloakBrowser proxy script
+│   ├── proxy_chat.py        # CloakBrowser chat proxy (with proxy rotation)
+│   └── proxy_edit.py        # CloakBrowser image edit proxy (with proxy rotation)
 ├── .github/
 │   └── workflows/
-│       └── proxy-chat.yml   # GH Actions workflow_dispatch
+│       ├── proxy-chat.yml   # Chat workflow_dispatch
+│       └── proxy-edit.yml   # Image edit workflow_dispatch
 ├── .env.example             # Required env vars template
 ├── requirements.txt         # Python deps (cloakbrowser, requests)
 ├── package.json             # Vercel project config
-└── vercel.json              # Vercel routing config
+├── vercel.json              # Vercel routing config
+└── README.md                # This file
 ```
 
 ## Environment Variables
@@ -192,7 +267,7 @@ ddg-api/
 
 ## Limitations
 
-- Request TTL: 120 seconds (expires if not polled in time)
+- Request TTL: 180 seconds (expires if not polled in time)
 - One request at a time per GH Actions runner
 - Images hosted on tmpfiles.org (temporary, auto-deletes)
 - No multi-turn conversation (single request/response)
@@ -204,3 +279,4 @@ ddg-api/
 - Manual header capture fails (`ERR_CHALLENGE` - missing fingerprint)
 - CloakBrowser = real browser, handles all anti-bot natively
 - Network interception of `/duckchat/v1/chat` response = reliable
+- Proxy rotation adds extra layer of anti-detection
