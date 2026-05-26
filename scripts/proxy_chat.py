@@ -1,27 +1,20 @@
 """
-Full CloakBrowser proxy: capture headers AND send DDG chat request.
+Full CloakBrowser proxy: interact with duck.ai directly via browser.
 Triggered by workflow_dispatch with message + request_id inputs.
-Stores response in Upstash Redis for Vercel API to retrieve.
+No manual API calls — the browser handles all anti-bot headers natively.
 """
 import json
 import os
 import time
-import uuid
-import base64
 import requests
 from cloakbrowser import launch
 
 UPSTASH_URL = os.environ["UPSTASH_REDIS_REST_URL"]
 UPSTASH_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
-DDG_CHAT_URL = "https://duck.ai/duckchat/v1/chat"
-DDG_PAGE_URL = "https://duck.ai"
+DDG_URL = "https://duck.ai"
 
-# From workflow_dispatch inputs
 MESSAGE = os.environ.get("CHAT_MESSAGE", "hello")
 REQUEST_ID = os.environ.get("REQUEST_ID", "unknown")
-
-captured = {}
-cookies_list = []
 
 
 def redis_set(key, value, ttl=120):
@@ -38,247 +31,168 @@ def redis_set(key, value, ttl=120):
     return r.status_code == 200
 
 
-def redis_get(key):
-    """Get value from Upstash Redis."""
-    r = requests.get(
-        f"{UPSTASH_URL}/get/{key}",
-        headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-        timeout=10,
-    )
-    data = r.json()
-    if data.get("result"):
-        try:
-            return json.loads(data["result"])
-        except (json.JSONDecodeError, TypeError):
-            return data["result"]
-    return None
-
-
-def on_response(response):
-    """Capture VQD hash from response headers."""
-    global captured
-    for key in ["x-vqd-hash-1", "x-vqd-4"]:
-        val = response.headers.get(key.lower()) or response.headers.get(key)
-        if val and key not in captured:
-            captured[key] = val
-            print(f"[+] Captured {key}")
-
-
-def on_request(request):
-    """Capture fe-version from outgoing requests."""
-    global captured
-    headers = request.headers
-    for key in ["x-fe-version", "x-fe-signals"]:
-        val = headers.get(key.lower())
-        if val and key not in captured:
-            captured[key] = val
-            print(f"[+] Captured {key}")
-
-
-def capture_headers():
-    """Use CloakBrowser to capture fresh DDG headers."""
-    global captured, cookies_list
-
+def send_chat_via_browser(message):
+    """Use CloakBrowser to type message into duck.ai and read the response."""
     print("[*] Launching CloakBrowser...")
     browser = launch(headless=True)
     page = browser.new_page()
-    page.on("request", on_request)
-    page.on("response", on_response)
 
     print("[*] Navigating to duck.ai...")
-    page.goto(DDG_PAGE_URL, wait_until="networkidle", timeout=60000)
+    page.goto(DDG_URL, wait_until="networkidle", timeout=60000)
 
-    # Dismiss consent overlay
+    # Dismiss consent overlays
     time.sleep(2)
-    try:
-        for sel in [
-            'button:has-text("Continue")',
-            'button:has-text("Start chatting")',
-            'button:has-text("Get Started")',
-        ]:
+    for sel in [
+        'button:has-text("Continue")',
+        'button:has-text("Start chatting")',
+        'button:has-text("Get Started")',
+        'button:has-text("I Agree")',
+        'button:has-text("Accept")',
+    ]:
+        try:
             btn = page.locator(sel)
             if btn.count() > 0 and btn.first.is_visible():
                 print(f"[+] Clicking: {sel}")
                 btn.first.click()
-                time.sleep(3)
+                time.sleep(2)
+        except Exception:
+            pass
+
+    # Find and fill the chat input
+    print(f"[*] Typing message: {message[:50]}...")
+    input_found = False
+    for sel in [
+        'textarea',
+        'textarea[placeholder]',
+        'div[contenteditable="true"]',
+        '#chat-input',
+        'input[type="text"]',
+    ]:
+        try:
+            el = page.locator(sel)
+            if el.count() > 0 and el.first.is_visible():
+                print(f"[+] Found input: {sel}")
+                el.first.click()
+                el.first.fill(message)
+                input_found = True
                 break
-    except Exception as e:
-        print(f"[*] No consent: {e}")
+        except Exception:
+            pass
 
-    time.sleep(5)
-    cookies_list = page.context.cookies()
-    print(f"[+] Captured {len(cookies_list)} cookies")
+    if not input_found:
+        print("[!] Could not find chat input field")
+        # Try to get the page HTML for debugging
+        html = page.content()
+        print(f"[*] Page title: {page.title()}")
+        print(f"[*] Page URL: {page.url}")
+        browser.close()
+        return {"error": "Could not find chat input", "title": page.title(), "url": page.url}
 
-    # Extract fe-version from page JS/HTML if not captured from request headers
-    if "x-fe-version" not in captured:
+    # Submit the message (Enter key)
+    time.sleep(1)
+    print("[*] Pressing Enter to submit...")
+    page.keyboard.press("Enter")
+
+    # Wait for response to appear and stabilize
+    print("[*] Waiting for AI response...")
+    time.sleep(15)  # Give DDG time to generate response
+
+    # Try to find and read the response
+    response_text = ""
+
+    # Method 1: Look for message bubbles / response containers
+    for sel in [
+        '[data-testid="message-content"]',
+        '.message-content',
+        '[class*="response"]',
+        '[class*="assistant"]',
+        '[class*="bot-message"]',
+        '[class*="ai-message"]',
+        '[role="article"]',
+        '.chat-message',
+        '[data-message-author-role="assistant"]',
+    ]:
         try:
-            html = page.content()
-            import re
-            # Try multiple patterns
-            patterns = [
-                r'serp_\d{8}_\d{6}_ET-[a-f0-9]+',
-                r'["\']x-fe-version["\']\s*:\s*["\']([^"\']+)["\']',
-                r'feVersion["\s:=]+["\']([^"\']+)',
-                r'FE_VERSION["\s:=]+["\']([^"\']+)',
-            ]
-            for pat in patterns:
-                match = re.search(pat, html)
-                if match:
-                    val = match.group(1) if match.lastindex else match.group(0)
-                    captured["x-fe-version"] = val
-                    print(f"[+] Extracted fe-version from HTML: {val[:50]}")
+            el = page.locator(sel)
+            if el.count() > 0:
+                texts = []
+                for i in range(el.count()):
+                    t = el.nth(i).inner_text().strip()
+                    if t and t != message:
+                        texts.append(t)
+                if texts:
+                    # Take the last message (the AI response)
+                    response_text = texts[-1]
+                    print(f"[+] Got response from selector: {sel}")
                     break
-        except Exception as e:
-            print(f"[*] HTML extraction failed: {e}")
+        except Exception:
+            pass
 
-    # Also try extracting from JS bundle scripts via page evaluation
-    if "x-fe-version" not in captured:
+    # Method 2: If no specific selector works, try getting all visible text after the input
+    if not response_text:
+        print("[*] Trying broad text extraction...")
         try:
-            # Look for the version string in all script tags
-            scripts = page.evaluate("""
+            # Get all divs that appeared after we sent the message
+            all_text = page.evaluate("""
                 () => {
-                    const scripts = document.querySelectorAll('script[src]');
-                    return Array.from(scripts).map(s => s.src);
+                    const msgs = document.querySelectorAll('div[class*="message"], div[class*="chat"], article, [data-testid]');
+                    return Array.from(msgs).map(el => el.innerText.trim()).filter(t => t.length > 20);
                 }
             """)
-            print(f"[*] Found {len(scripts)} script sources")
-            for src in scripts:
-                if 'chunk' in src or 'app' in src or 'main' in src:
-                    try:
-                        resp = requests.get(src, timeout=10)
-                        match = re.search(r'serp_\d{8}_\d{6}_ET-[a-f0-9]+', resp.text)
-                        if match:
-                            captured["x-fe-version"] = match.group(0)
-                            print(f"[+] Extracted fe-version from JS bundle: {match.group(0)[:50]}")
-                            break
-                    except Exception:
-                        pass
+            if all_text:
+                response_text = all_text[-1]
+                print(f"[+] Got response from broad extraction: {response_text[:80]}")
         except Exception as e:
-            print(f"[*] JS bundle extraction failed: {e}")
+            print(f"[*] Broad extraction failed: {e}")
 
-    if "x-fe-version" not in captured:
-        print("[!] WARNING: x-fe-version not found - will try chat without it")
+    # Method 3: Get full page text and try to extract the response
+    if not response_text:
+        print("[*] Trying full page text extraction...")
+        try:
+            full_text = page.evaluate("() => document.body.innerText")
+            # The response should be after our message
+            if message in full_text:
+                parts = full_text.split(message, 1)
+                if len(parts) > 1:
+                    response_text = parts[1].strip()
+                    # Clean up - take only until the next UI element
+                    for stop in ["\nSend", "\nType a message", "\nNew Chat", "\nPowered by"]:
+                        if stop in response_text:
+                            response_text = response_text[:response_text.index(stop)].strip()
+                    print(f"[+] Got response from page split: {response_text[:80]}")
+        except Exception as e:
+            print(f"[*] Page text extraction failed: {e}")
+
+    # Take a screenshot for debugging
+    try:
+        page.screenshot(path="/tmp/ddg_response.png", full_page=True)
+        print("[+] Saved screenshot to /tmp/ddg_response.png")
+    except Exception:
+        pass
 
     browser.close()
 
-    # Generate fe-signals if not captured
-    if "x-fe-signals" not in captured:
-        now = int(time.time() * 1000)
-        signals = {
-            "start": now,
-            "events": [{"name": "startNewChat_free", "delta": 84}],
-            "end": now + 100,
-        }
-        captured["x-fe-signals"] = base64.b64encode(
-            json.dumps(signals).encode()
-        ).decode()
-        print("[+] Generated x-fe-signals")
-
-
-def send_chat(message):
-    """Send chat request to DDG using captured headers."""
-    if not captured.get("x-vqd-hash-1"):
-        print("[!] Missing required header: x-vqd-hash-1")
-        return {"error": "Missing x-vqd-hash-1", "have": list(captured.keys())}
-
-    cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies_list) if cookies_list else ""
-
-    now = int(time.time() * 1000)
-    signals = {
-        "start": now,
-        "events": [{"name": "startNewChat_free", "delta": 84}],
-        "end": now + 100,
-    }
-    fe_signals = base64.b64encode(json.dumps(signals).encode()).decode()
-
-    payload = {
-        "model": "gpt-5-mini",
-        "metadata": {
-            "toolChoice": {
-                "NewsSearch": False,
-                "VideosSearch": False,
-                "LocalSearch": False,
-                "WeatherForecast": False,
-            },
-            "x-vqd-hash-1": captured["x-vqd-hash-1"],
-        },
-        "messages": [{"role": "user", "content": message}],
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "accept": "text/event-stream",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-        "x-fe-signals": fe_signals,
-        "x-ddg-journey-id": uuid.uuid4().hex,
-        "Origin": "https://duck.ai",
-        "Referer": "https://duck.ai/",
-    }
-    if captured.get("x-fe-version"):
-        headers["x-fe-version"] = captured["x-fe-version"]
-    if cookie_str:
-        headers["Cookie"] = cookie_str
-
-    print(f"[*] Sending chat to DDG: {message[:50]}...")
-    try:
-        ddg_res = requests.post(DDG_CHAT_URL, headers=headers, json=payload, timeout=60, stream=True)
-    except requests.RequestException as e:
-        return {"error": f"Request failed: {e}"}
-
-    if not ddg_res.ok:
-        err_text = ddg_res.text[:500]
-        print(f"[!] DDG returned {ddg_res.status_code}: {err_text}")
+    if not response_text or len(response_text) < 5:
         return {
-            "error": f"DDG returned {ddg_res.status_code}",
-            "detail": err_text,
-            "status_code": ddg_res.status_code,
+            "error": "Could not extract response from page",
+            "attempted_text": response_text[:200] if response_text else "",
         }
 
-    # Read streamed SSE response
-    full_text = ""
-    for line in ddg_res.iter_lines(decode_unicode=True):
-        if not line or not line.startswith("data: ") or "[DONE]" in line:
-            continue
-        data = line[6:]
-        try:
-            j = json.loads(data)
-            # Try message field first (streaming format)
-            if j.get("message"):
-                full_text += j["message"]
-            # Try messages[0].parts[0].text (complete format)
-            elif not full_text:
-                try:
-                    parts = j.get("messages", [{}])[0].get("parts", [])
-                    for p in parts:
-                        if p.get("text"):
-                            full_text += p["text"]
-                except (IndexError, KeyError):
-                    pass
-        except json.JSONDecodeError:
-            pass
-
-    result = full_text.strip() or "No response text extracted"
-    print(f"[+] Got response: {result[:80]}...")
-    return {"status": "success", "model": "gpt-5-mini", "response": result}
+    return {"status": "success", "model": "gpt-5-mini", "response": response_text}
 
 
 def main():
     # Mark request as processing
     redis_set(f"chat:{REQUEST_ID}", {"status": "processing"}, ttl=120)
 
-    # Step 1: Capture headers
-    capture_headers()
-    if not captured:
-        redis_set(f"chat:{REQUEST_ID}", {"status": "error", "error": "Failed to capture headers"}, ttl=120)
-        exit(1)
+    # Send chat via browser
+    result = send_chat_via_browser(MESSAGE)
 
-    # Step 2: Send chat
-    result = send_chat(MESSAGE)
-
-    # Step 3: Store response in Redis
+    # Store response in Redis
     result["status"] = "done" if result.get("status") == "success" else "error"
     redis_set(f"chat:{REQUEST_ID}", result, ttl=120)
     print(f"[+] Stored result for request {REQUEST_ID}")
+    print(f"[*] Result: {json.dumps(result)[:200]}")
 
 
 if __name__ == "__main__":
