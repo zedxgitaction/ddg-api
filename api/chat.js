@@ -1,9 +1,11 @@
-// Vercel Serverless Function: DDG AI Chat API
+// Vercel Serverless Function: DDG AI Chat + Image Edit API
 //
-// POST /api/chat          { "message": "hello" }                          → triggers chat, returns { request_id }
-// POST /api/chat/result   { "id": "xxx" }                                 → polls Redis for chat result
-// POST /api/edit          { "image_url": "url", "prompt": "edit this" }   → triggers image edit, returns { request_id }
-// POST /api/edit/result   { "id": "xxx" }                                 → polls Redis for edit result
+// POST /api/chat        { "message": "hello" }                          → { status: "triggered", request_id }
+// POST /api/chat/result { "id": "xxx" }                                 → polls Redis for chat result
+// POST /api/edit        { "image_url": "url", "prompt": "edit this" }   → { status: "triggered", request_id }
+// POST /api/edit/result { "id": "xxx" }                                 → polls Redis for edit result
+//
+// GH Actions (CloakBrowser) handles the actual DDG request to bypass IP blocking.
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -18,7 +20,7 @@ function randomId() {
 }
 
 function parseBody(req) {
-  if (req.body) return req.body;
+  if (req.body && typeof req.body === "object") return req.body;
   try {
     return JSON.parse(req.body || "{}");
   } catch {
@@ -26,7 +28,7 @@ function parseBody(req) {
   }
 }
 
-async function redisSet(key, value, ttl = 120) {
+async function redisSet(key, value, ttl = 180) {
   const r = await fetch(`${UPSTASH_URL}/pipeline`, {
     method: "POST",
     headers: {
@@ -86,65 +88,10 @@ export default async function handler(req, res) {
   const body = parseBody(req);
   const url = req.url || "";
 
-  // ============ IMAGE EDIT ENDPOINTS ============
-
-  // Poll edit result: POST /api/edit/result { "id": "xxx" }
-  if (url.includes("/edit/result")) {
+  // ─── CHAT RESULT POLL ───
+  if (url.includes("/chat/result")) {
     const id = body.id;
-    if (!id) {
-      return res.status(400).json({ error: 'Missing "id" in request body' });
-    }
-    const data = await redisGet(`edit:${id}`);
-    if (!data) {
-      return res.status(200).json({
-        status: "waiting",
-        message: "Edit request still processing or expired. GH Actions takes ~30-60s.",
-      });
-    }
-    return res.status(200).json(data);
-  }
-
-  // Trigger edit: POST /api/edit { "image_url": "url", "prompt": "edit this" }
-  if (url.includes("/edit")) {
-    const imageUrl = body.image_url;
-    const prompt = body.prompt;
-    if (!imageUrl) {
-      return res.status(400).json({ error: 'Missing "image_url" in request body' });
-    }
-    if (!prompt) {
-      return res.status(400).json({ error: 'Missing "prompt" in request body' });
-    }
-    if (!GH_PAT) {
-      return res.status(500).json({ error: "GH_PAT not configured" });
-    }
-
-    const requestId = randomId();
-    await redisSet(`edit:${requestId}`, { status: "queued" }, 180);
-
-    const triggered = await triggerWorkflow("proxy-edit.yml", {
-      image_url: imageUrl,
-      edit_prompt: prompt,
-      request_id: requestId,
-    });
-    if (!triggered) {
-      return res.status(500).json({ error: "Failed to trigger image edit workflow" });
-    }
-
-    return res.status(200).json({
-      status: "triggered",
-      request_id: requestId,
-      note: "POST to /api/edit/result with { \"id\": \"<request_id>\" } to get the edited image.",
-    });
-  }
-
-  // ============ CHAT ENDPOINTS ============
-
-  // Poll chat result: POST /api/chat/result { "id": "xxx" }
-  if (url.includes("/result")) {
-    const id = body.id;
-    if (!id) {
-      return res.status(400).json({ error: 'Missing "id" in request body' });
-    }
+    if (!id) return res.status(400).json({ error: 'Missing "id" in request body' });
 
     const data = await redisGet(`chat:${id}`);
     if (!data) {
@@ -153,19 +100,58 @@ export default async function handler(req, res) {
         message: "Request still processing or expired. GH Actions takes ~30-60s.",
       });
     }
-
     return res.status(200).json(data);
   }
 
-  // Trigger chat: POST /api/chat { "message": "hello" }
-  const msg = body.message;
-  if (!msg) {
-    return res.status(400).json({ error: 'Missing "message" in request body' });
+  // ─── EDIT RESULT POLL ───
+  if (url.includes("/edit/result")) {
+    const id = body.id;
+    if (!id) return res.status(400).json({ error: 'Missing "id" in request body' });
+
+    const data = await redisGet(`chat:${id}`);
+    if (!data) {
+      return res.status(200).json({
+        status: "waiting",
+        message: "Edit still processing or expired. GH Actions takes ~60-120s.",
+      });
+    }
+    return res.status(200).json(data);
   }
 
-  if (!GH_PAT) {
-    return res.status(500).json({ error: "GH_PAT not configured" });
+  // ─── IMAGE EDIT TRIGGER ───
+  if (url.includes("/edit")) {
+    const image_url = body.image_url;
+    const prompt = body.prompt;
+    if (!image_url) return res.status(400).json({ error: 'Missing "image_url" in request body' });
+    if (!prompt) return res.status(400).json({ error: 'Missing "prompt" in request body' });
+
+    if (!GH_PAT) return res.status(500).json({ error: "GH_PAT not configured" });
+
+    const requestId = randomId();
+    await redisSet(`chat:${requestId}`, { status: "queued" }, 180);
+
+    const triggered = await triggerWorkflow("proxy-edit.yml", {
+      image_url,
+      edit_prompt: prompt,
+      request_id: requestId,
+    });
+
+    if (!triggered) {
+      return res.status(500).json({ error: "Failed to trigger GH Actions workflow" });
+    }
+
+    return res.status(200).json({
+      status: "triggered",
+      request_id: requestId,
+      note: 'POST to /api/edit/result with { "id": "<request_id>" } to get the result.',
+    });
   }
+
+  // ─── CHAT TRIGGER (default) ───
+  const msg = body.message;
+  if (!msg) return res.status(400).json({ error: 'Missing "message" in request body' });
+
+  if (!GH_PAT) return res.status(500).json({ error: "GH_PAT not configured" });
 
   const requestId = randomId();
   await redisSet(`chat:${requestId}`, { status: "queued" }, 180);
@@ -174,6 +160,7 @@ export default async function handler(req, res) {
     message: msg,
     request_id: requestId,
   });
+
   if (!triggered) {
     return res.status(500).json({ error: "Failed to trigger GH Actions workflow" });
   }
@@ -181,6 +168,6 @@ export default async function handler(req, res) {
   return res.status(200).json({
     status: "triggered",
     request_id: requestId,
-    note: "POST to /api/chat/result with { \"id\": \"<request_id>\" } to get the response.",
+    note: 'POST to /api/chat/result with { "id": "<request_id>" } to get the response.',
   });
 }

@@ -19,6 +19,14 @@
       "dest": "api/chat.js"
     },
     {
+      "src": "/api/edit/result",
+      "dest": "api/chat.js"
+    },
+    {
+      "src": "/api/edit",
+      "dest": "api/chat.js"
+    },
+    {
       "src": "/api/chat",
       "dest": "api/chat.js"
     }
