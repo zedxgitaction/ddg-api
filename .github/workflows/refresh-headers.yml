@@ -1,0 +1,29 @@
+name: Refresh DDG Headers
+
+on:
+  schedule:
+    # Every 4 minutes
+    - cron: '*/4 * * * *'
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install CloakBrowser binary
+        run: python -m cloakbrowser install
+
+      - name: Capture and upload headers
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: python scripts/capture_headers.py

@@ -1,0 +1,9 @@
+{
+  "name": "ddg-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DuckDuckGo AI Chat API via Vercel + CloakBrowser header refresh",
+  "engines": {
+    "node": ">=18"
+  }
+}
