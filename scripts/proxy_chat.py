@@ -263,7 +263,7 @@ def find_chat_input(page):
 
 
 def send_text_to_input(page, msg):
-    """Type text into the chat input and press Enter."""
+    """Type text into the chat input and press Enter (with button fallback)."""
     chat_input = find_chat_input(page)
     if not chat_input:
         print("[!] Could not find chat input")
@@ -274,7 +274,28 @@ def send_text_to_input(page, msg):
         time.sleep(0.3)
         chat_input.fill(msg)
         time.sleep(0.5)
-        page.keyboard.press("Enter")
+
+        # Try clicking submit button first
+        submitted = click_any(page, [
+            'button[aria-label*="Send" i]',
+            'button[aria-label*="Ask" i]',
+            'button[aria-label*="Submit" i]',
+            'button[data-testid*="send" i]',
+            'button[data-testid*="submit" i]',
+            'button[type="submit"]',
+        ])
+        if not submitted:
+            chat_input.press("Enter")
+            time.sleep(0.5)
+            try:
+                val = chat_input.input_value()
+                if val and len(val) > 10:
+                    print("[*] Enter didn't work, trying again...")
+                    chat_input.press("Enter")
+                    time.sleep(0.5)
+            except Exception:
+                pass
+
         print(f"[+] Sent message: {msg[:80]}")
         return True
     except Exception as e:
@@ -429,7 +450,30 @@ def send_chat_via_browser(message):
     chat_input.fill(final_prompt)
     time.sleep(1)
     print("[*] Submitting...")
-    page.keyboard.press("Enter")
+
+    # Try clicking the submit/ask button first
+    submitted = click_any(page, [
+        'button[aria-label*="Send" i]',
+        'button[aria-label*="Ask" i]',
+        'button[aria-label*="Submit" i]',
+        'button[data-testid*="send" i]',
+        'button[data-testid*="submit" i]',
+        'button[type="submit"]',
+        'button:has(svg[aria-hidden="true"])',
+    ])
+    if not submitted:
+        # Fallback to Enter key
+        page.keyboard.press("Enter")
+        time.sleep(0.5)
+        # Double-check: if input still has text, try Enter again
+        try:
+            val = chat_input.input_value()
+            if val and len(val) > 10:
+                print("[*] Enter didn't work, trying again...")
+                chat_input.press("Enter")
+                time.sleep(0.5)
+        except Exception:
+            pass
 
     # Wait for initial response
     wait_time = 60 if img_request else 30
