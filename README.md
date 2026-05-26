@@ -1,6 +1,6 @@
 # DDG API
 
-Free AI chat, image generation, and image editing API powered by [duck.ai](https://duck.ai) via CloakBrowser on GitHub Actions with rotating proxies.
+Free AI chat, image generation, and image editing API powered by [duck.ai](https://duck.ai) via CloakBrowser on GitHub Actions.
 
 **Live API:** https://ddg-api-iota.vercel.app
 
@@ -10,39 +10,55 @@ Free AI chat, image generation, and image editing API powered by [duck.ai](https
 User sends message
      |
      v
-POST /api/chat  -->  Stores in Redis  -->  Triggers GH Actions
-     |                                         |
-     v                                         v
-Returns request_id                   CloakBrowser opens duck.ai
-                                             |
-                                             v
-                                    Types message, presses Enter
-                                             |
-                                             v
-                                    Intercepts duck.ai response
-                                             |
-                                             v
-                               If text (question) --> stores "needs_reply" in Redis
-                               If image (base64)  --> uploads to tmpfiles.org
-                               If nothing         --> takes screenshot, uploads
-                                             |
-     +---------------------------------------+
+POST /api/chat or /api/image  -->  Stores in Redis  -->  Triggers GH Actions
+     |                                                         |
+     v                                                         v
+Returns request_id                                CloakBrowser opens duck.ai
+                                                         |
+                                                         v
+                                              Types message, presses Submit
+                                                         |
+                                                         v
+                                              Intercepts duck.ai response
+                                                         |
+                                                         v
+                                         If text (question) --> stores "needs_reply"
+                                         If image (base64)  --> uploads to tmpfiles.org
+                                         If nothing         --> takes screenshot
+                                                         |
+     +---------------------------------------------------+
      v
-POST /api/chat/result  -->  Reads from Redis  -->  Returns JSON
+POST /api/chat/result or /api/image/result  -->  Reads from Redis  -->  Returns JSON
 ```
 
 ## API Endpoints
 
-All endpoints are POST-only with JSON body.
+| # | Method | Endpoint | Body | Description |
+|---|--------|----------|------|-------------|
+| 1 | `GET` | `/api/chat` | — | Health check (for UptimeRobot) |
+| 2 | `POST` | `/api/chat` | `{ "message": "..." }` | Send chat / image gen request |
+| 3 | `POST` | `/api/chat/result` | `{ "id": "..." }` | Poll for chat result |
+| 4 | `POST` | `/api/chat/reply` | `{ "id": "...", "message": "..." }` | Reply to duck.ai's follow-up question |
+| 5 | `POST` | `/api/edit` | `{ "image_url": "...", "prompt": "..." }` | Send image edit request |
+| 6 | `POST` | `/api/edit/result` | `{ "id": "..." }` | Poll for edit result |
+| 7 | `POST` | `/api/edit/reply` | `{ "id": "...", "message": "..." }` | Reply to duck.ai's follow-up question |
+| 8 | `POST` | `/api/image` | `{ "prompt": "..." }` | Dedicated image gen (clicks Imagine sidebar) |
+| 9 | `POST` | `/api/image/result` | `{ "id": "..." }` | Poll for image gen result |
 
-| # | Endpoint | Body | Description |
-|---|----------|------|-------------|
-| 1 | `/api/chat` | `{ "message": "..." }` | Send chat / image gen request |
-| 2 | `/api/chat/result` | `{ "id": "..." }` | Poll for chat result |
-| 3 | `/api/chat/reply` | `{ "id": "...", "message": "..." }` | Reply to duck.ai's follow-up question |
-| 4 | `/api/edit` | `{ "image_url": "...", "prompt": "..." }` | Send image edit request |
-| 5 | `/api/edit/result` | `{ "id": "..." }` | Poll for edit result |
-| 6 | `/api/edit/reply` | `{ "id": "...", "message": "..." }` | Reply to duck.ai's follow-up question |
+---
+
+### Health Check
+
+```bash
+curl "https://ddg-api-iota.vercel.app/api/chat"
+```
+
+**Response:**
+```json
+{ "status": "ok", "timestamp": 1779796100000 }
+```
+
+Use this with [UptimeRobot](https://uptimerobot.com) to keep the API warm (prevent cold starts).
 
 ---
 
@@ -51,7 +67,7 @@ All endpoints are POST-only with JSON body.
 ```bash
 curl -X POST "https://ddg-api-iota.vercel.app/api/chat" \
   -H "Content-Type: application/json" \
-  -d '{"message": "generate an image of a cute cat"}'
+  -d '{"message": "what is the capital of France?"}'
 ```
 
 **Response:**
@@ -77,8 +93,7 @@ curl -X POST "https://ddg-api-iota.vercel.app/api/chat/result" \
     "status": "done",
     "model": "gpt-5-mini",
     "images": ["https://tmpfiles.org/dl/xxxx/ddg_image_0.jpg"],
-    "type": "image",
-    "proxy": "px043005.pointtoserver.com:10780"
+    "type": "image"
 }
 ```
 
@@ -87,9 +102,8 @@ curl -X POST "https://ddg-api-iota.vercel.app/api/chat/result" \
 {
     "status": "done",
     "model": "gpt-5-mini",
-    "response": "Here is the answer...",
-    "type": "text",
-    "proxy": "px043005.pointtoserver.com:10780"
+    "response": "The capital of France is Paris.",
+    "type": "text"
 }
 ```
 
@@ -103,8 +117,6 @@ curl -X POST "https://ddg-api-iota.vercel.app/api/chat/result" \
 ```
 
 ### 3. Chat — Reply to Follow-up Question
-
-When the result returns `status: "needs_reply"`, reply to duck.ai's question:
 
 ```bash
 curl -X POST "https://ddg-api-iota.vercel.app/api/chat/reply" \
@@ -155,8 +167,7 @@ curl -X POST "https://ddg-api-iota.vercel.app/api/edit/result" \
 {
     "status": "done",
     "images": ["https://tmpfiles.org/dl/xxxx/ddg_edit_0.jpg"],
-    "type": "image",
-    "proxy": "px031901.pointtoserver.com:10780"
+    "type": "image"
 }
 ```
 
@@ -166,16 +177,6 @@ curl -X POST "https://ddg-api-iota.vercel.app/api/edit/result" \
     "status": "needs_reply",
     "text": "What style should the sunglasses be?",
     "request_id": "abc123def456"
-}
-```
-
-**Response (screenshot fallback — duck.ai didn't generate image):**
-```json
-{
-    "status": "done",
-    "images": ["https://tmpfiles.org/dl/xxxx/ddg_edit_screenshot.png"],
-    "type": "screenshot",
-    "note": "duck.ai did not generate an edited image. This is a screenshot of the conversation."
 }
 ```
 
@@ -191,12 +192,61 @@ Then poll `/api/edit/result` again for the final edited image.
 
 ---
 
+### 7. Dedicated Image Generation — Trigger
+
+This endpoint opens duck.ai in **Imagine/Image mode** (via sidebar click) for dedicated image generation. Better results than the chat endpoint for image-only requests.
+
+```bash
+curl -X POST "https://ddg-api-iota.vercel.app/api/image" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "an extremely cute fluffy baby cat with big sparkling eyes"}'
+```
+
+**Response:**
+```json
+{
+    "status": "triggered",
+    "request_id": "wdbq8nm6wpe5",
+    "note": "POST to /api/image/result with { \"id\": \"<request_id>\" } to get the image."
+}
+```
+
+### 8. Dedicated Image Generation — Poll for Result
+
+```bash
+curl -X POST "https://ddg-api-iota.vercel.app/api/image/result" \
+  -H "Content-Type: application/json" \
+  -d '{"id": "wdbq8nm6wpe5"}'
+```
+
+**Response (image):**
+```json
+{
+    "status": "done",
+    "model": "gpt-5-mini",
+    "images": ["https://tmpfiles.org/dl/xxxx/ddg_image_0.jpg"],
+    "type": "image"
+}
+```
+
+**Response (screenshot fallback):**
+```json
+{
+    "status": "done",
+    "images": ["https://tmpfiles.org/dl/xxxx/ddg_image_screenshot.png"],
+    "type": "screenshot",
+    "note": "duck.ai did not generate an image. This is a screenshot of the conversation."
+}
+```
+
+---
+
 ## Multi-Turn Conversation
 
 duck.ai often asks follow-up questions before generating images:
 
-1. Send your request via `/api/chat` or `/api/edit` → get `request_id`
-2. Poll `/api/chat/result` or `/api/edit/result`
+1. Send your request via `/api/chat`, `/api/edit`, or `/api/image` → get `request_id`
+2. Poll the corresponding `/result` endpoint
 3. If `status: "needs_reply"` — duck.ai asked something (age confirmation, style preference, etc.)
 4. Reply via `/api/chat/reply` or `/api/edit/reply` with your answer
 5. Poll the result endpoint again → get the final image or text
@@ -223,21 +273,21 @@ def poll_result(endpoint, request_id, max_wait=120):
             return result  # Caller must reply via /reply endpoint
     return {"error": "Timeout"}
 
-# --- Chat: Image generation ---
-r = requests.post(f"{BASE}/chat", json={"message": "generate an image of a cat"})
+# --- Dedicated Image Generation (recommended for images) ---
+r = requests.post(f"{BASE}/image", json={"prompt": "a cute fluffy baby cat"})
 data = r.json()
-result = poll_result("chat", data["request_id"])
-
-if result.get("status") == "needs_reply":
-    # duck.ai asked a question — reply to it
-    r2 = requests.post(f"{BASE}/chat/reply", json={
-        "id": data["request_id"],
-        "message": "yes, make it"
-    })
-    result = poll_result("chat", data["request_id"])
+result = poll_result("image", data["request_id"])
 
 if result.get("images"):
     print(result["images"][0])  # tmpfiles.org URL
+
+# --- Chat ---
+r = requests.post(f"{BASE}/chat", json={"message": "hello"})
+data = r.json()
+result = poll_result("chat", data["request_id"])
+
+if result.get("response"):
+    print(result["response"])
 
 # --- Image Editing ---
 r = requests.post(f"{BASE}/edit", json={
@@ -247,13 +297,6 @@ r = requests.post(f"{BASE}/edit", json={
 data = r.json()
 result = poll_result("edit", data["request_id"])
 
-if result.get("status") == "needs_reply":
-    r2 = requests.post(f"{BASE}/edit/reply", json={
-        "id": data["request_id"],
-        "message": "just do it"
-    })
-    result = poll_result("edit", data["request_id"])
-
 if result.get("images"):
     print(result["images"][0])
 ```
@@ -261,14 +304,28 @@ if result.get("images"):
 ## Quick Start (curl)
 
 ```bash
-# --- Chat (Image Gen) ---
+# --- Health Check ---
+curl "https://ddg-api-iota.vercel.app/api/chat"
+
+# --- Dedicated Image Gen ---
 # 1. Trigger
-curl -X POST "https://ddg-api-iota.vercel.app/api/chat" \
+curl -X POST "https://ddg-api-iota.vercel.app/api/image" \
   -H "Content-Type: application/json" \
-  -d '{"message": "generate an image of a cute baby bunny"}'
+  -d '{"prompt": "a cute baby bunny wearing sunglasses"}'
 # → { "status": "triggered", "request_id": "xxx" }
 
 # 2. Poll (wait ~30s, then every 8s)
+curl -X POST "https://ddg-api-iota.vercel.app/api/image/result" \
+  -H "Content-Type: application/json" \
+  -d '{"id": "xxx"}'
+
+# --- Chat ---
+# 1. Trigger
+curl -X POST "https://ddg-api-iota.vercel.app/api/chat" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "generate an image of a cute cat"}'
+
+# 2. Poll
 curl -X POST "https://ddg-api-iota.vercel.app/api/chat/result" \
   -H "Content-Type: application/json" \
   -d '{"id": "xxx"}'
@@ -284,7 +341,7 @@ curl -X POST "https://ddg-api-iota.vercel.app/api/edit" \
   -H "Content-Type: application/json" \
   -d '{"image_url": "https://example.com/bunny.jpg", "prompt": "add cool sunglasses"}'
 
-# 2. Poll (wait ~60s, then every 8s)
+# 2. Poll
 curl -X POST "https://ddg-api-iota.vercel.app/api/edit/result" \
   -H "Content-Type: application/json" \
   -d '{"id": "xxx"}'
@@ -307,29 +364,23 @@ curl -X POST "https://ddg-api-iota.vercel.app/api/edit/reply" \
 | gpt-oss-120b | Open-source |
 | GPT Image 2 | OpenAI (image gen) |
 
-## Proxy Rotation
+## Architecture
 
-All requests go through rotating proxies for anti-detection. 5 proxies are used randomly per request:
-
-| Proxy | Type |
-|-------|------|
-| px043005.pointtoserver.com:10780 | PureVPN |
-| px043005.pointtoserver.com:10780 | PureVPN (alt account) |
-| px031901.pointtoserver.com:10780 | PureVPN |
-| p101.squidproxies.com:9088 | SquidProxies |
-| 136.179.19.164:3128 | Residential |
+- **Chat + Edit:** CloakBrowser with proxy rotation (PureVPN, SquidProxies, residential)
+- **Image Gen:** CloakBrowser direct connection (no proxy) — clicks Imagine mode in duck.ai sidebar
+- **All requests:** GH Actions → CloakBrowser → duck.ai → Redis → Vercel returns result
 
 ## Timing
 
 | Type | Time |
 |------|------|
-| GH Actions startup + CloakBrowser install | ~2 min |
-| Text response | ~20-30s |
-| Image generation | ~30-60s |
+| Chat (text) | ~20-30s |
+| Chat (image gen) | ~30-60s |
+| Dedicated image gen (`/api/image`) | ~30-45s |
 | Image editing | ~5 min per attempt (luck-based) |
 | Screenshot fallback | ~5 min (if duck.ai gives nothing) |
 
-**Polling strategy:** Wait 30s after trigger for chat, 60s for edit. Then poll every 8s. Max 120s.
+**Polling strategy:** Wait 30s after trigger, then poll every 8s. Max 120s.
 
 ## Response Statuses
 
@@ -347,14 +398,16 @@ All requests go through rotating proxies for anti-detection. 5 proxies are used 
 ```
 ddg-api/
 ├── api/
-│   └── chat.js              # Vercel serverless function (6 endpoints)
+│   └── chat.js              # Vercel serverless function (9 endpoints)
 ├── scripts/
 │   ├── proxy_chat.py        # CloakBrowser chat proxy (multi-turn + screenshot fallback)
-│   └── proxy_edit.py        # CloakBrowser image edit proxy (multi-turn + screenshot fallback)
+│   ├── proxy_edit.py        # CloakBrowser image edit proxy (multi-turn + screenshot fallback)
+│   └── proxy_image.py       # CloakBrowser image gen proxy (Imagine sidebar mode)
 ├── .github/
 │   └── workflows/
 │       ├── proxy-chat.yml   # Chat workflow_dispatch
-│       └── proxy-edit.yml   # Image edit workflow_dispatch
+│       ├── proxy-edit.yml   # Image edit workflow_dispatch
+│       └── proxy-image.yml  # Image gen workflow_dispatch
 ├── requirements.txt         # Python deps (cloakbrowser, requests)
 ├── package.json             # Vercel project config
 ├── vercel.json              # Vercel routing config
@@ -368,7 +421,7 @@ ddg-api/
 |----------|-------------|
 | `UPSTASH_REDIS_REST_URL` | Upstash Redis REST URL |
 | `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis read token |
-| `GH_PAT` | GitHub Personal Access Token (to trigger workflow) |
+| `GH_PAT` | GitHub Personal Access Token (classic, with `repo` + `workflow` scopes) |
 
 ### GitHub Secrets
 | Variable | Description |
@@ -376,15 +429,25 @@ ddg-api/
 | `UPSTASH_REDIS_REST_URL` | Upstash Redis REST URL |
 | `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis write token |
 
+## UptimeRobot Setup
+
+To prevent cold starts on Vercel free tier:
+
+1. Sign up at [UptimeRobot](https://uptimerobot.com)
+2. Add New Monitor → Type: HTTP(s)
+3. URL: `https://ddg-api-iota.vercel.app/api/chat`
+4. Interval: 5 minutes
+5. Save
+
+This keeps the serverless function warm so first requests are fast.
+
 ## Known Limitations
 
 - **Image edit is luck-based** — duck.ai sometimes generates images, sometimes doesn't. Retry if it fails.
-- **~2 min GH Actions startup** — CloakBrowser install takes time
 - **One request at a time** per GH Actions runner
 - **Images hosted on tmpfiles.org** — temporary, auto-deletes after some time
 - **Input images for edit** must be on persistent URLs (tmpfiles.org expires fast, use catbox.moe)
 - **CloakBrowser segfaults** intermittently on GH Actions (~60% success rate)
-- **Prompt truncation** at ~100 chars in CloakBrowser input
 - **Rate limit** depends on duck.ai
 
 ## Why Browser Intercept?
@@ -392,7 +455,7 @@ ddg-api/
 - Vercel DC IPs get blocked (`ERR_BN_LIMIT` — bot network detection)
 - Manual header capture fails (`ERR_CHALLENGE` — missing fingerprint)
 - CloakBrowser = real browser, handles all anti-bot natively
-- Proxy rotation adds extra layer of anti-detection
+- Proxy rotation adds extra layer of anti-detection (chat + edit)
 
 ## License
 
