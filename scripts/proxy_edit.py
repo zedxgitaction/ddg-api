@@ -493,7 +493,7 @@ def send_edit_via_browser(image_url, edit_prompt):
 
 
 def main():
-    redis_set(f"chat:{REQUEST_ID}", {"status": "processing"}, ttl=180)
+    redis_set(f"chat:{REQUEST_ID}", {"status": "processing"}, ttl=300)
 
     if not IMAGE_URL:
         result = {"error": "IMAGE_URL is required", "status": "error"}
@@ -501,7 +501,7 @@ def main():
         result = send_edit_via_browser(IMAGE_URL, EDIT_PROMPT)
 
     result["status"] = "done" if result.get("status") == "success" else "error"
-    redis_set(f"chat:{REQUEST_ID}", result, ttl=180)
+    redis_set(f"chat:{REQUEST_ID}", result, ttl=300)
     print(f"[+] Stored result for request {REQUEST_ID}")
     print(f"[*] Result: {json.dumps(result)[:500]}")
 
