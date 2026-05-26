@@ -1,0 +1,37 @@
+name: Proxy DDG Chat
+
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: 'User message to send to DDG AI'
+        required: true
+        type: string
+      request_id:
+        description: 'Unique request ID for response retrieval'
+        required: true
+        type: string
+
+jobs:
+  proxy-chat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install CloakBrowser binary
+        run: python -m cloakbrowser install
+
+      - name: Capture headers and send chat
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CHAT_MESSAGE: ${{ inputs.message }}
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: python scripts/proxy_chat.py
