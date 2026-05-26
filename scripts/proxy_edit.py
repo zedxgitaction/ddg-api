@@ -156,6 +156,14 @@ def craft_edit_prompt(prompt):
     """
     prompt = prompt.strip()
 
+    # Critical constraint suffix — forces duck.ai to edit immediately without questions
+    CRITICAL_SUFFIX = (
+        " CRITICAL API CONSTRAINT: Do not reply with text. Do not ask for clarification, "
+        "preferences, style, or color choices. If any details are unspecified, make a creative "
+        "decision yourself and execute the image edit immediately. Your entire response must "
+        "only be the final edited image."
+    )
+
     # If prompt already includes clear instructions, keep it
     direct_starters = [
         "edit", "change", "modify", "transform", "convert", "turn",
@@ -163,9 +171,9 @@ def craft_edit_prompt(prompt):
         "make the", "change the", "add a", "remove the",
     ]
     if any(prompt.lower().startswith(s) for s in direct_starters):
-        return f"{prompt}. Do this now without asking questions."
+        return f"{prompt}.{CRITICAL_SUFFIX}"
 
-    return f"Edit this image: {prompt}. Apply this edit now without asking questions."
+    return f"Edit this image: {prompt}.{CRITICAL_SUFFIX}"
 
 
 def upload_image_to_page(page, image_bytes):
@@ -462,7 +470,7 @@ def send_edit_via_browser(image_url, edit_prompt):
                 if text and len(text) > 10:
                     print(f"[*] DDG responded with text ({len(text)} chars) — sending followup")
                     followup_sent = True
-                    send_followup("Just edit the image now. No questions, just do the edit.")
+                    send_followup("Do not reply with text. Generate and show only the final edited image now. No questions.")
                     continue
 
             # After 50s with no images, try one more followup
@@ -471,7 +479,7 @@ def send_edit_via_browser(image_url, edit_prompt):
                 if text and len(text) > 10:
                     print(f"[*] Still no images after followup, trying again")
                     followup2_sent = True
-                    send_followup("Generate the edited image now. Apply the edit directly.")
+                    send_followup("CRITICAL: No text. Output only the edited image. Execute the edit now.")
                     continue
 
             if elapsed >= 90:
