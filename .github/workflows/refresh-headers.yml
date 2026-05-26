@@ -2,8 +2,8 @@ name: Refresh DDG Headers
 
 on:
   schedule:
-    # Every 4 minutes
-    - cron: '*/4 * * * *'
+    # Every 5 minutes (GitHub Actions minimum)
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
