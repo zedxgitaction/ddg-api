@@ -18,13 +18,21 @@ async function getHeaders() {
   }
 }
 
-function randomJourneyId() {
+function randomHex(len) {
   const hex = "0123456789abcdef";
-  let id = "";
-  for (let i = 0; i < 32; i++) {
-    id += hex[Math.floor(Math.random() * 16)];
-  }
-  return id;
+  let s = "";
+  for (let i = 0; i < len; i++) s += hex[Math.floor(Math.random() * 16)];
+  return s;
+}
+
+function freshSignals() {
+  const now = Date.now();
+  const signals = {
+    start: now,
+    events: [{ name: "startNewChat_free", delta: 84 }],
+    end: now + 100,
+  };
+  return Buffer.from(JSON.stringify(signals)).toString("base64");
 }
 
 export default async function handler(req, res) {
@@ -74,13 +82,12 @@ export default async function handler(req, res) {
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
     "x-fe-version": headers["x-fe-version"],
-    "x-fe-signals": headers["x-fe-signals"] || "",
-    "x-ddg-journey-id": randomJourneyId(),
+    "x-fe-signals": freshSignals(),
+    "x-ddg-journey-id": randomHex(32),
     Origin: "https://duck.ai",
     Referer: "https://duck.ai/",
   };
 
-  // Include cookies if captured
   if (headers.cookies) {
     ddgHeaders["Cookie"] = headers.cookies;
   }
@@ -97,9 +104,9 @@ export default async function handler(req, res) {
       return res.status(ddgRes.status).json({
         error: `DDG returned ${ddgRes.status}`,
         detail: errText.slice(0, 500),
-        headers_used: {
+        debug: {
+          "x-vqd-hash-1": headers["x-vqd-hash-1"]?.slice(0, 30) + "...",
           "x-fe-version": headers["x-fe-version"]?.slice(0, 40) + "...",
-          "x-vqd-hash-1": headers["x-vqd-hash-1"]?.slice(0, 40) + "...",
           has_cookies: !!headers.cookies,
         },
       });
@@ -112,8 +119,7 @@ export default async function handler(req, res) {
       if (!line.startsWith("data: ") || line.includes("[DONE]")) continue;
       try {
         const json = JSON.parse(line.slice(6));
-        const message = json.message;
-        if (message) fullText += message;
+        if (json.message) fullText += json.message;
       } catch {}
     }
 
@@ -123,11 +129,7 @@ export default async function handler(req, res) {
         try {
           const json = JSON.parse(line.slice(6));
           const parts = json.messages?.[0]?.parts;
-          if (parts) {
-            for (const p of parts) {
-              if (p.text) fullText += p.text;
-            }
-          }
+          if (parts) for (const p of parts) if (p.text) fullText += p.text;
         } catch {}
       }
     }
@@ -136,7 +138,6 @@ export default async function handler(req, res) {
       status: "success",
       model: "gpt-5-mini",
       response: fullText.trim() || "No response text extracted",
-      raw_length: raw.length,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
