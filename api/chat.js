@@ -1,7 +1,7 @@
 // Vercel Serverless Function: DDG AI Chat API (Full Proxy)
 //
-// GET /api/chat?msg=hello        → triggers GH Actions proxy, returns { request_id }
-// GET /api/chat/result?id=xxx    → polls Redis for result
+// POST /api/chat        { "message": "hello" }        → triggers GH Actions proxy, returns { request_id }
+// POST /api/chat/result { "id": "xxx" }                → polls Redis for result
 //
 // GH Actions (CloakBrowser) handles the actual DDG request to bypass IP blocking.
 
@@ -16,6 +16,15 @@ function randomId() {
   let s = "";
   for (let i = 0; i < 12; i++) s += chars[Math.floor(Math.random() * chars.length)];
   return s;
+}
+
+function parseBody(req) {
+  if (req.body) return req.body;
+  try {
+    return JSON.parse(req.body || "{}");
+  } catch {
+    return {};
+  }
 }
 
 async function redisSet(key, value, ttl = 120) {
@@ -64,34 +73,41 @@ async function triggerWorkflow(message, requestId) {
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method !== "GET") {
-    return res.status(405).json({ error: "Use GET" });
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
   }
 
-  // Poll for result: GET /api/chat/result?id=xxx
-  if (req.url.startsWith("/api/chat/result") || req.query.result !== undefined) {
-    const id = req.query.id;
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Use POST with JSON body" });
+  }
+
+  const body = parseBody(req);
+
+  // Poll for result: POST /api/chat/result { "id": "xxx" }
+  if (req.url.includes("/result")) {
+    const id = body.id;
     if (!id) {
-      return res.status(400).json({ error: "Missing ?id= parameter" });
+      return res.status(400).json({ error: 'Missing "id" in request body' });
     }
 
     const data = await redisGet(`chat:${id}`);
     if (!data) {
       return res.status(200).json({
         status: "waiting",
-        message: "Request still processing or expired. GH Actions takes 15-30s.",
+        message: "Request still processing or expired. GH Actions takes ~30-60s.",
       });
     }
 
     return res.status(200).json(data);
   }
 
-  // Trigger: GET /api/chat?msg=hello
-  const msg = req.query.msg;
+  // Trigger: POST /api/chat { "message": "hello" }
+  const msg = body.message;
   if (!msg) {
-    return res.status(400).json({ error: "Missing ?msg= parameter" });
+    return res.status(400).json({ error: 'Missing "message" in request body' });
   }
 
   if (!GH_PAT) {
@@ -100,10 +116,8 @@ export default async function handler(req, res) {
 
   const requestId = randomId();
 
-  // Store initial state
   await redisSet(`chat:${requestId}`, { status: "queued" }, 120);
 
-  // Trigger GH Actions
   const triggered = await triggerWorkflow(msg, requestId);
   if (!triggered) {
     return res.status(500).json({ error: "Failed to trigger GH Actions workflow" });
@@ -112,7 +126,6 @@ export default async function handler(req, res) {
   return res.status(200).json({
     status: "triggered",
     request_id: requestId,
-    poll: `/api/chat/result?id=${requestId}`,
-    note: "Poll the result endpoint. GH Actions takes 15-30s to complete.",
+    note: "POST to /api/chat/result with { \"id\": \"<request_id>\" } to get the response.",
   });
 }
