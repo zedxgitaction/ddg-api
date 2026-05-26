@@ -67,26 +67,12 @@ def upload_to_tmpfiles(image_bytes, filename="image.png"):
 
 
 def extract_images_from_page(page):
-    """Extract base64 images from canvas, data-URLs, and <img> tags."""
+    """Extract base64 images from canvas, data-URLs, blob, and <img> tags."""
     return page.evaluate("""
-        () => {
+        async () => {
             const results = [];
 
-            // 1. Canvas elements → base64 PNG
-            document.querySelectorAll('canvas').forEach((canvas, i) => {
-                const w = canvas.width;
-                const h = canvas.height;
-                if (w > 50 && h > 50) {
-                    try {
-                        const dataUrl = canvas.toDataURL('image/png');
-                        if (dataUrl.length > 5000) {
-                            results.push({ type: 'base64', data: dataUrl, width: w, height: h });
-                        }
-                    } catch(e) {}
-                }
-            });
-
-            // 2. <img> tags with data: URLs (base64 embedded images)
+            // 1. <img> tags with data: URLs (base64 embedded images)
             document.querySelectorAll('img[src^="data:"]').forEach(img => {
                 const src = img.src;
                 if (src.length > 5000) {
@@ -94,24 +80,19 @@ def extract_images_from_page(page):
                 }
             });
 
-            // 3. <img> tags with blob: URLs — need to draw to canvas to extract
-            document.querySelectorAll('img[src^="blob:"]').forEach((img, i) => {
+            // 2. <img> tags with blob: URLs — fetch full binary (not canvas!)
+            for (const img of document.querySelectorAll('img[src^="blob:"]')) {
                 try {
-                    const canvas = document.createElement('canvas');
-                    canvas.width = img.naturalWidth || img.width;
-                    canvas.height = img.naturalHeight || img.height;
-                    if (canvas.width > 50 && canvas.height > 50) {
-                        const ctx = canvas.getContext('2d');
-                        ctx.drawImage(img, 0, 0);
-                        const dataUrl = canvas.toDataURL('image/png');
-                        if (dataUrl.length > 5000) {
-                            results.push({ type: 'base64', data: dataUrl, width: canvas.width, height: canvas.height });
-                        }
+                    const resp = await fetch(img.src);
+                    const buf = await resp.arrayBuffer();
+                    const arr = Array.from(new Uint8Array(buf));
+                    if (arr.length > 5000) {
+                        results.push({ type: 'blob_bytes', data: arr, width: img.naturalWidth, height: img.naturalHeight });
                     }
                 } catch(e) {}
-            });
+            }
 
-            // 4. Background images that are data: URLs
+            // 3. Background images that are data: URLs
             document.querySelectorAll('[style*="data:image"]').forEach(el => {
                 const style = el.getAttribute('style') || '';
                 const match = style.match(/url\\((data:image\\/[^)]+)\\)/);
@@ -120,7 +101,7 @@ def extract_images_from_page(page):
                 }
             });
 
-            // 5. Regular <img> tags with http/https URLs
+            // 4. Regular <img> tags with http/https URLs
             document.querySelectorAll('img[src^="http"]').forEach(img => {
                 const src = img.src;
                 const w = img.naturalWidth || img.width;
@@ -131,7 +112,7 @@ def extract_images_from_page(page):
                 }
             });
 
-            // 6. <a> tags linking directly to image files
+            // 5. <a> tags linking directly to image files
             document.querySelectorAll('a[href]').forEach(a => {
                 const href = a.href;
                 if (/\\.(png|jpg|jpeg|webp|gif)(\\?|$)/i.test(href)) {
@@ -195,6 +176,25 @@ def send_chat_via_browser(message):
     print("[*] Launching CloakBrowser...")
     browser = launch(headless=True)
     page = browser.new_page()
+
+    # Network-level image capture (full resolution, no canvas quality loss)
+    captured_images = []  # list of {"url": str, "body": bytes, "content_type": str}
+
+    def on_response(response):
+        try:
+            ct = response.headers.get("content-type", "")
+            url = response.url
+            if ct.startswith("image/") and response.status == 200:
+                cl = int(response.headers.get("content-length", "0"))
+                if cl > 5000 or cl == 0:
+                    print(f"[+] Intercepted image: {url[:80]} ({ct}, {cl}b)")
+                    body = response.body()
+                    if len(body) > 5000:
+                        captured_images.append({"url": url, "body": body, "content_type": ct})
+        except Exception:
+            pass
+
+    page.on("response", on_response)
 
     print("[*] Navigating to duck.ai...")
     page.goto(DDG_URL, wait_until="domcontentloaded", timeout=60000)
@@ -328,17 +328,40 @@ def send_chat_via_browser(message):
         if text:
             result["response"] = text
 
-    # Upload images to tmpfiles.org
-    if final_images:
-        print(f"[*] Uploading {len(final_images)} image(s) to tmpfiles.org...")
-        tmp_urls = []
+    # Upload images to tmpfiles.org — network-captured first (full res), DOM fallback
+    tmp_urls = []
+
+    # PRIORITY 1: Network-intercepted images (original quality, no canvas loss)
+    if captured_images:
+        print(f"[*] Processing {len(captured_images)} network-intercepted image(s)...")
+        for idx, img in enumerate(captured_images):
+            ct = img["content_type"]
+            ext = "png"
+            if "jpeg" in ct or "jpg" in ct:
+                ext = "jpg"
+            elif "webp" in ct:
+                ext = "webp"
+            elif "gif" in ct:
+                ext = "gif"
+            url = upload_to_tmpfiles(img["body"], f"ddg_image_{idx}.{ext}")
+            if url:
+                tmp_urls.append(url)
+
+    # PRIORITY 2: DOM-extracted images (fallback)
+    if not tmp_urls and final_images:
+        print(f"[*] No network images, falling back to {len(final_images)} DOM image(s)...")
         for idx, img in enumerate(final_images):
             img_data = img.get("data", "")
             img_type = img.get("type", "")
-
             try:
-                if img_data.startswith("data:image/"):
-                    # Extract base64 from data URL
+                if img_type == "blob_bytes" and isinstance(img_data, list):
+                    # blob bytes from fetch()
+                    img_bytes = bytes(img_data)
+                    url = upload_to_tmpfiles(img_bytes, f"ddg_image_{idx}.png")
+                    if url:
+                        tmp_urls.append(url)
+
+                elif isinstance(img_data, str) and img_data.startswith("data:image/"):
                     header, b64 = img_data.split(",", 1)
                     ext = "png" if "png" in header else "jpg"
                     img_bytes = base64.b64decode(b64)
@@ -346,32 +369,24 @@ def send_chat_via_browser(message):
                     if url:
                         tmp_urls.append(url)
 
-                elif img_type == "url" and img_data.startswith("http"):
-                    # Download image from URL, then re-upload to tmpfiles
-                    print(f"[*] Downloading image from URL: {img_data[:100]}")
+                elif img_type == "url" and isinstance(img_data, str) and img_data.startswith("http"):
+                    print(f"[*] Downloading: {img_data[:100]}")
                     dl = requests.get(img_data, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
                     if dl.status_code == 200 and len(dl.content) > 1000:
-                        # Detect extension from content-type
                         ct = dl.headers.get("content-type", "")
                         ext = "png"
-                        if "jpeg" in ct or "jpg" in ct:
-                            ext = "jpg"
-                        elif "webp" in ct:
-                            ext = "webp"
-                        elif "gif" in ct:
-                            ext = "gif"
+                        if "jpeg" in ct or "jpg" in ct: ext = "jpg"
+                        elif "webp" in ct: ext = "webp"
+                        elif "gif" in ct: ext = "gif"
                         url = upload_to_tmpfiles(dl.content, f"ddg_image_{idx}.{ext}")
                         if url:
                             tmp_urls.append(url)
-                    else:
-                        print(f"[!] Download failed: status={dl.status_code}, size={len(dl.content)}")
-
             except Exception as e:
                 print(f"[!] Failed to process image {idx}: {e}")
 
-        if tmp_urls:
-            result["images"] = tmp_urls
-            result["type"] = "image"
+    if tmp_urls:
+        result["images"] = tmp_urls
+        result["type"] = "image"
 
     # Fallback: if image request but no images extracted from DOM, upload screenshot
     if is_image_request and not result.get("images") and screenshot_bytes and len(screenshot_bytes) > 5000:
