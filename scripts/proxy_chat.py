@@ -32,6 +32,18 @@ def get_random_proxy():
     return random.choice(PROXIES)
 
 
+def parse_proxy(proxy_url):
+    """Parse proxy URL into server, username, password for CloakBrowser."""
+    from urllib.parse import urlparse
+    parsed = urlparse(proxy_url)
+    server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+    result = {"server": server}
+    if parsed.username and parsed.password:
+        result["username"] = parsed.username
+        result["password"] = parsed.password
+    return result
+
+
 def redis_set(key, value, ttl=180):
     r = requests.post(
         f"{UPSTASH_URL}/pipeline",
@@ -188,10 +200,11 @@ def send_chat_via_browser(message):
 
     # Select random proxy
     proxy = get_random_proxy()
-    print(f"[*] Using proxy: {proxy.split('@')[1] if '@' in proxy else proxy}")
+    proxy_config = parse_proxy(proxy)
+    print(f"[*] Using proxy: {proxy_config['server']}")
     print(f"[*] Image request: {is_image_request}")
     print("[*] Launching CloakBrowser...")
-    browser = launch(headless=True, proxy={"server": proxy})
+    browser = launch(headless=True, proxy=proxy_config)
     page = browser.new_page()
 
     # Network-level image capture
@@ -329,7 +342,7 @@ def send_chat_via_browser(message):
     browser.close()
 
     # Build result
-    result = {"status": "success", "model": "gpt-5-mini", "proxy": proxy.split('@')[1] if '@' in proxy else proxy}
+    result = {"status": "success", "model": "gpt-5-mini", "proxy": proxy_config['server']}
 
     # Clean text
     if last_text:
