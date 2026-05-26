@@ -1,11 +1,11 @@
 """
-Full CloakBrowser proxy: interact with duck.ai directly via browser.
-Triggered by workflow_dispatch with message + request_id inputs.
-No manual API calls — the browser handles all anti-bot headers natively.
+Full CloakBrowser proxy: use duck.ai's own chat UI via browser.
+Intercepts the chat API response directly from network — no header guessing.
 """
 import json
 import os
 import time
+import re
 import requests
 from cloakbrowser import launch
 
@@ -16,9 +16,10 @@ DDG_URL = "https://duck.ai"
 MESSAGE = os.environ.get("CHAT_MESSAGE", "hello")
 REQUEST_ID = os.environ.get("REQUEST_ID", "unknown")
 
+chat_response = {"text": "", "done": False}
+
 
 def redis_set(key, value, ttl=120):
-    """Store value in Upstash Redis with TTL."""
     r = requests.post(
         f"{UPSTASH_URL}/pipeline",
         headers={
@@ -31,168 +32,168 @@ def redis_set(key, value, ttl=120):
     return r.status_code == 200
 
 
+def on_response(response):
+    """Intercept DDG chat API response."""
+    global chat_response
+    url = response.url
+    if "duckchat" in url and "/chat" in url:
+        print(f"[+] Intercepted chat response: {url[:80]}")
+        try:
+            body = response.text()
+            full_text = ""
+            for line in body.split("\n"):
+                if not line.startswith("data: ") or "[DONE]" in line:
+                    continue
+                data = line[6:]
+                try:
+                    j = json.loads(data)
+                    if j.get("message"):
+                        full_text += j["message"]
+                except json.JSONDecodeError:
+                    pass
+            if full_text:
+                chat_response["text"] = full_text.strip()
+                chat_response["done"] = True
+                print(f"[+] Captured response: {full_text[:80]}...")
+        except Exception as e:
+            print(f"[!] Error reading response: {e}")
+
+
 def send_chat_via_browser(message):
-    """Use CloakBrowser to type message into duck.ai and read the response."""
+    """Use CloakBrowser to chat on duck.ai by intercepting the API response."""
+    global chat_response
+    chat_response = {"text": "", "done": False}
+
     print("[*] Launching CloakBrowser...")
     browser = launch(headless=True)
     page = browser.new_page()
+    page.on("response", on_response)
 
     print("[*] Navigating to duck.ai...")
-    page.goto(DDG_URL, wait_until="networkidle", timeout=60000)
+    page.goto(DDG_URL, wait_until="domcontentloaded", timeout=60000)
+    time.sleep(5)
 
-    # Dismiss consent overlays
-    time.sleep(2)
-    for sel in [
-        'button:has-text("Continue")',
-        'button:has-text("Start chatting")',
-        'button:has-text("Get Started")',
-        'button:has-text("I Agree")',
-        'button:has-text("Accept")',
-    ]:
-        try:
-            btn = page.locator(sel)
-            if btn.count() > 0 and btn.first.is_visible():
-                print(f"[+] Clicking: {sel}")
-                btn.first.click()
-                time.sleep(2)
-        except Exception:
-            pass
+    # Step 1: Dismiss overlays
+    for _ in range(3):
+        dismissed = False
+        for sel in [
+            'button:has-text("Continue")',
+            'button:has-text("I Agree")',
+            'button:has-text("Accept")',
+            'button:has-text("Got It")',
+            'button:has-text("Start chatting")',
+            'button:has-text("Get Started")',
+        ]:
+            try:
+                btn = page.locator(sel)
+                if btn.count() > 0 and btn.first.is_visible():
+                    print(f"[+] Clicking: {sel}")
+                    btn.first.click()
+                    time.sleep(2)
+                    dismissed = True
+                    break
+            except Exception:
+                pass
+        if not dismissed:
+            break
 
-    # Find and fill the chat input
-    print(f"[*] Typing message: {message[:50]}...")
-    input_found = False
+    time.sleep(3)
+    page.screenshot(path="/tmp/ddg_chat_ui.png")
+
+    # Step 2: Find the chat textarea (NOT the search bar)
+    # duck.ai: search bar is in the header, chat input is in the chat area
+    chat_input = None
+
+    # Try specific chat input selectors
     for sel in [
-        'textarea',
-        'textarea[placeholder]',
-        'div[contenteditable="true"]',
-        '#chat-input',
-        'input[type="text"]',
+        'textarea#chat-input',
+        'textarea[name="chat-input"]',
+        'textarea[aria-label*="chat" i]',
+        'textarea[aria-label*="message" i]',
+        'textarea[placeholder*="Ask" i]',
+        'textarea[placeholder*="message" i]',
+        'textarea[placeholder*="Type" i]',
+        'div[role="textbox"][contenteditable="true"]',
     ]:
         try:
             el = page.locator(sel)
             if el.count() > 0 and el.first.is_visible():
-                print(f"[+] Found input: {sel}")
-                el.first.click()
-                el.first.fill(message)
-                input_found = True
+                chat_input = el.first
+                print(f"[+] Found chat input: {sel}")
                 break
         except Exception:
             pass
 
-    if not input_found:
-        print("[!] Could not find chat input field")
-        # Try to get the page HTML for debugging
-        html = page.content()
-        print(f"[*] Page title: {page.title()}")
-        print(f"[*] Page URL: {page.url}")
-        browser.close()
-        return {"error": "Could not find chat input", "title": page.title(), "url": page.url}
-
-    # Submit the message (Enter key)
-    time.sleep(1)
-    print("[*] Pressing Enter to submit...")
-    page.keyboard.press("Enter")
-
-    # Wait for response to appear and stabilize
-    print("[*] Waiting for AI response...")
-    time.sleep(15)  # Give DDG time to generate response
-
-    # Try to find and read the response
-    response_text = ""
-
-    # Method 1: Look for message bubbles / response containers
-    for sel in [
-        '[data-testid="message-content"]',
-        '.message-content',
-        '[class*="response"]',
-        '[class*="assistant"]',
-        '[class*="bot-message"]',
-        '[class*="ai-message"]',
-        '[role="article"]',
-        '.chat-message',
-        '[data-message-author-role="assistant"]',
-    ]:
+    # Fallback: find textarea closest to bottom of viewport
+    if not chat_input:
+        print("[*] Fallback: finding textarea by position...")
         try:
-            el = page.locator(sel)
-            if el.count() > 0:
-                texts = []
-                for i in range(el.count()):
-                    t = el.nth(i).inner_text().strip()
-                    if t and t != message:
-                        texts.append(t)
-                if texts:
-                    # Take the last message (the AI response)
-                    response_text = texts[-1]
-                    print(f"[+] Got response from selector: {sel}")
-                    break
-        except Exception:
-            pass
-
-    # Method 2: If no specific selector works, try getting all visible text after the input
-    if not response_text:
-        print("[*] Trying broad text extraction...")
-        try:
-            # Get all divs that appeared after we sent the message
-            all_text = page.evaluate("""
+            info = page.evaluate("""
                 () => {
-                    const msgs = document.querySelectorAll('div[class*="message"], div[class*="chat"], article, [data-testid]');
-                    return Array.from(msgs).map(el => el.innerText.trim()).filter(t => t.length > 20);
+                    const textareas = document.querySelectorAll('textarea');
+                    return Array.from(textareas).map((ta, i) => ({
+                        index: i,
+                        id: ta.id,
+                        placeholder: ta.placeholder,
+                        ariaLabel: ta.getAttribute('aria-label'),
+                        rect: ta.getBoundingClientRect(),
+                        visible: ta.offsetParent !== null
+                    })).filter(t => t.visible);
                 }
             """)
-            if all_text:
-                response_text = all_text[-1]
-                print(f"[+] Got response from broad extraction: {response_text[:80]}")
+            print(f"[*] Visible textareas: {json.dumps(info)}")
+            # Pick the one with the largest y (bottom-most)
+            if info:
+                best = max(info, key=lambda t: t['rect']['y'])
+                idx = best['index']
+                chat_input = page.locator('textarea').nth(idx)
+                print(f"[+] Selected textarea #{idx} at y={best['rect']['y']}")
         except Exception as e:
-            print(f"[*] Broad extraction failed: {e}")
+            print(f"[*] Textarea detection failed: {e}")
 
-    # Method 3: Get full page text and try to extract the response
-    if not response_text:
-        print("[*] Trying full page text extraction...")
-        try:
-            full_text = page.evaluate("() => document.body.innerText")
-            # The response should be after our message
-            if message in full_text:
-                parts = full_text.split(message, 1)
-                if len(parts) > 1:
-                    response_text = parts[1].strip()
-                    # Clean up - take only until the next UI element
-                    for stop in ["\nSend", "\nType a message", "\nNew Chat", "\nPowered by"]:
-                        if stop in response_text:
-                            response_text = response_text[:response_text.index(stop)].strip()
-                    print(f"[+] Got response from page split: {response_text[:80]}")
-        except Exception as e:
-            print(f"[*] Page text extraction failed: {e}")
+    if not chat_input:
+        print("[!] Could not find chat input")
+        browser.close()
+        return {"error": "Could not find chat input"}
 
-    # Take a screenshot for debugging
-    try:
-        page.screenshot(path="/tmp/ddg_response.png", full_page=True)
-        print("[+] Saved screenshot to /tmp/ddg_response.png")
-    except Exception:
-        pass
+    # Step 3: Type and submit
+    print(f"[*] Typing: {message[:50]}")
+    chat_input.click()
+    time.sleep(0.5)
+    chat_input.fill(message)
+    time.sleep(1)
+
+    print("[*] Submitting (Enter)...")
+    page.keyboard.press("Enter")
+
+    # Step 4: Wait for response to be intercepted
+    print("[*] Waiting for chat API response...")
+    for i in range(20):  # Up to 50 seconds
+        time.sleep(2.5)
+        if chat_response["done"]:
+            break
+        if i % 4 == 3:
+            print(f"[*] Still waiting... ({(i+1)*2.5}s)")
+
+    page.screenshot(path="/tmp/ddg_final.png")
 
     browser.close()
 
-    if not response_text or len(response_text) < 5:
-        return {
-            "error": "Could not extract response from page",
-            "attempted_text": response_text[:200] if response_text else "",
-        }
+    if chat_response["done"] and chat_response["text"]:
+        return {"status": "success", "model": "gpt-5-mini", "response": chat_response["text"]}
 
-    return {"status": "success", "model": "gpt-5-mini", "response": response_text}
+    return {"error": "No chat API response intercepted", "partial": chat_response["text"][:200]}
 
 
 def main():
-    # Mark request as processing
     redis_set(f"chat:{REQUEST_ID}", {"status": "processing"}, ttl=120)
 
-    # Send chat via browser
     result = send_chat_via_browser(MESSAGE)
 
-    # Store response in Redis
     result["status"] = "done" if result.get("status") == "success" else "error"
     redis_set(f"chat:{REQUEST_ID}", result, ttl=120)
     print(f"[+] Stored result for request {REQUEST_ID}")
-    print(f"[*] Result: {json.dumps(result)[:200]}")
+    print(f"[*] Result: {json.dumps(result)[:300]}")
 
 
 if __name__ == "__main__":
