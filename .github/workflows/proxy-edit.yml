@@ -1,0 +1,42 @@
+name: Proxy DDG Image Edit
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_url:
+        description: 'URL of the image to edit'
+        required: true
+        type: string
+      edit_prompt:
+        description: 'Edit instruction for the image'
+        required: true
+        type: string
+      request_id:
+        description: 'Unique request ID for response retrieval'
+        required: true
+        type: string
+
+jobs:
+  proxy-edit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install CloakBrowser binary
+        run: python -m cloakbrowser install
+
+      - name: Edit image via DDG
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          IMAGE_URL: ${{ inputs.image_url }}
+          EDIT_PROMPT: ${{ inputs.edit_prompt }}
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: python scripts/proxy_edit.py
