@@ -120,6 +120,25 @@ def extract_images_from_page(page):
                 }
             });
 
+            // 5. Regular <img> tags with http/https URLs
+            document.querySelectorAll('img[src^="http"]').forEach(img => {
+                const src = img.src;
+                const w = img.naturalWidth || img.width;
+                const h = img.naturalHeight || img.height;
+                const skip = ['favicon', 'icon', 'avatar', 'logo', '.svg'];
+                if (w > 50 && h > 50 && !skip.some(k => src.toLowerCase().includes(k))) {
+                    results.push({ type: 'url', data: src, width: w, height: h });
+                }
+            });
+
+            // 6. <a> tags linking directly to image files
+            document.querySelectorAll('a[href]').forEach(a => {
+                const href = a.href;
+                if (/\\.(png|jpg|jpeg|webp|gif)(\\?|$)/i.test(href)) {
+                    results.push({ type: 'url', data: href, width: 0, height: 0 });
+                }
+            });
+
             return results;
         }
     """)
@@ -300,17 +319,40 @@ def send_chat_via_browser(message):
         tmp_urls = []
         for idx, img in enumerate(final_images):
             img_data = img.get("data", "")
-            if img_data.startswith("data:image/"):
-                # Extract base64 from data URL
-                header, b64 = img_data.split(",", 1)
-                ext = "png" if "png" in header else "jpg"
-                try:
+            img_type = img.get("type", "")
+
+            try:
+                if img_data.startswith("data:image/"):
+                    # Extract base64 from data URL
+                    header, b64 = img_data.split(",", 1)
+                    ext = "png" if "png" in header else "jpg"
                     img_bytes = base64.b64decode(b64)
                     url = upload_to_tmpfiles(img_bytes, f"ddg_image_{idx}.{ext}")
                     if url:
                         tmp_urls.append(url)
-                except Exception as e:
-                    print(f"[!] Failed to decode image {idx}: {e}")
+
+                elif img_type == "url" and img_data.startswith("http"):
+                    # Download image from URL, then re-upload to tmpfiles
+                    print(f"[*] Downloading image from URL: {img_data[:100]}")
+                    dl = requests.get(img_data, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+                    if dl.status_code == 200 and len(dl.content) > 1000:
+                        # Detect extension from content-type
+                        ct = dl.headers.get("content-type", "")
+                        ext = "png"
+                        if "jpeg" in ct or "jpg" in ct:
+                            ext = "jpg"
+                        elif "webp" in ct:
+                            ext = "webp"
+                        elif "gif" in ct:
+                            ext = "gif"
+                        url = upload_to_tmpfiles(dl.content, f"ddg_image_{idx}.{ext}")
+                        if url:
+                            tmp_urls.append(url)
+                    else:
+                        print(f"[!] Download failed: status={dl.status_code}, size={len(dl.content)}")
+
+            except Exception as e:
+                print(f"[!] Failed to process image {idx}: {e}")
 
         if tmp_urls:
             result["images"] = tmp_urls
