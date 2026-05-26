@@ -1,7 +1,6 @@
 """
 Full CloakBrowser proxy: interact with duck.ai chat directly via browser.
-Triggered by workflow_dispatch with message + request_id inputs.
-Intercepts network requests for image URLs + DOM text extraction.
+For images: extracts base64 from canvas/data-URLs, uploads to tmpfiles.org, returns URLs.
 """
 import json
 import os
@@ -17,11 +16,8 @@ DDG_URL = "https://duck.ai"
 MESSAGE = os.environ.get("CHAT_MESSAGE", "hello")
 REQUEST_ID = os.environ.get("REQUEST_ID", "unknown")
 
-# Collect image URLs from network
-captured_images = []
 
-
-def redis_set(key, value, ttl=120):
+def redis_set(key, value, ttl=180):
     r = requests.post(
         f"{UPSTASH_URL}/pipeline",
         headers={
@@ -48,69 +44,83 @@ def click_any(page, selectors):
     return False
 
 
-def on_request(request):
-    """Capture image URLs from outgoing requests."""
-    url = request.url
-    # DDG image URLs from their generation service
-    if any(x in url for x in ["blob:", "generated", "image", "creativity", "img"]):
-        if url not in captured_images and not url.startswith("data:"):
-            captured_images.append(url)
-            print(f"[+] Captured image URL: {url[:80]}")
-
-
-def on_response(response):
-    """Capture image URLs from responses."""
-    url = response.url
-    content_type = ""
+def upload_to_tmpfiles(image_bytes, filename="image.png"):
+    """Upload image bytes to tmpfiles.org, return the URL."""
     try:
-        content_type = response.headers.get("content-type", "")
-    except Exception:
-        pass
+        r = requests.post(
+            "https://tmpfiles.org/api/v1/upload",
+            files={"file": (filename, image_bytes, "image/png")},
+            timeout=30,
+        )
+        data = r.json()
+        if data.get("status") == "success" and data.get("data", {}).get("url"):
+            # tmpfiles.org returns view URL, convert to direct download
+            url = data["data"]["url"]
+            direct = url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+            print(f"[+] Uploaded to tmpfiles: {direct}")
+            return direct
+        print(f"[!] tmpfiles response: {data}")
+        return None
+    except Exception as e:
+        print(f"[!] tmpfiles upload failed: {e}")
+        return None
 
-    if "image" in content_type or any(x in url for x in ["generated", "creativity", "imgproxy"]):
-        if url not in captured_images:
-            captured_images.append(url)
-            print(f"[+] Captured image from response: {url[:80]}")
 
-
-def extract_images_from_dom(page):
-    """Extract image URLs/blobs from the DOM."""
+def extract_images_from_page(page):
+    """Extract base64 images from canvas, data-URLs, and <img> tags."""
     return page.evaluate("""
         () => {
-            const images = [];
+            const results = [];
 
-            // Get all img elements
-            document.querySelectorAll('img').forEach(img => {
-                const src = img.src || img.getAttribute('src') || '';
-                if (src && !src.startsWith('data:') && src.length > 20) {
-                    // Filter out logos/icons/avatars
-                    if (!src.includes('logo') && !src.includes('icon') && !src.includes('avatar')
-                        && !src.includes('favicon') && !src.includes('badge')) {
-                        images.push(src);
-                    }
+            // 1. Canvas elements → base64 PNG
+            document.querySelectorAll('canvas').forEach((canvas, i) => {
+                const w = canvas.width;
+                const h = canvas.height;
+                if (w > 50 && h > 50) {
+                    try {
+                        const dataUrl = canvas.toDataURL('image/png');
+                        if (dataUrl.length > 5000) {
+                            results.push({ type: 'base64', data: dataUrl, width: w, height: h });
+                        }
+                    } catch(e) {}
                 }
             });
 
-            // Check for canvas elements (DDG sometimes renders images to canvas)
-            document.querySelectorAll('canvas').forEach((canvas, i) => {
+            // 2. <img> tags with data: URLs (base64 embedded images)
+            document.querySelectorAll('img[src^="data:"]').forEach(img => {
+                const src = img.src;
+                if (src.length > 5000) {
+                    results.push({ type: 'base64', data: src, width: img.naturalWidth, height: img.naturalHeight });
+                }
+            });
+
+            // 3. <img> tags with blob: URLs — need to draw to canvas to extract
+            document.querySelectorAll('img[src^="blob:"]').forEach((img, i) => {
                 try {
-                    const dataUrl = canvas.toDataURL('image/png');
-                    if (dataUrl && dataUrl.length > 1000) {
-                        images.push(dataUrl);
+                    const canvas = document.createElement('canvas');
+                    canvas.width = img.naturalWidth || img.width;
+                    canvas.height = img.naturalHeight || img.height;
+                    if (canvas.width > 50 && canvas.height > 50) {
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0);
+                        const dataUrl = canvas.toDataURL('image/png');
+                        if (dataUrl.length > 5000) {
+                            results.push({ type: 'base64', data: dataUrl, width: canvas.width, height: canvas.height });
+                        }
                     }
                 } catch(e) {}
             });
 
-            // Check background images
-            document.querySelectorAll('[style*="background-image"]').forEach(el => {
+            // 4. Background images that are data: URLs
+            document.querySelectorAll('[style*="data:image"]').forEach(el => {
                 const style = el.getAttribute('style') || '';
-                const match = style.match(/url\(['"]?([^'")\s]+)['"]?\)/);
-                if (match && match[1] && match[1].length > 20) {
-                    images.push(match[1]);
+                const match = style.match(/url\\((data:image\\/[^)]+)\\)/);
+                if (match && match[1].length > 5000) {
+                    results.push({ type: 'base64', data: match[1], width: 0, height: 0 });
                 }
             });
 
-            return [...new Set(images)];
+            return results;
         }
     """)
 
@@ -119,7 +129,6 @@ def extract_text_response(page, message):
     """Extract text response from DOM."""
     return page.evaluate("""
         (userMsg) => {
-            // Find all message-like containers
             const selectors = [
                 '[data-message-author-role="assistant"]',
                 '[data-testid*="message"]',
@@ -139,12 +148,10 @@ def extract_text_response(page, message):
                 }
             }
 
-            // Fallback: find text after user message
             const body = document.body.innerText;
             const msgIdx = body.indexOf(userMsg);
             if (msgIdx >= 0) {
                 const after = body.substring(msgIdx + userMsg.length).trim();
-                // Remove common UI noise
                 const lines = after.split('\\n').filter(l => {
                     const t = l.trim();
                     return t && !['Got It!', 'How It Works', 'Send', 'New Chat',
@@ -160,20 +167,15 @@ def extract_text_response(page, message):
 
 
 def send_chat_via_browser(message):
-    global captured_images
-    captured_images = []
-
     is_image_request = any(w in message.lower() for w in [
         "image", "picture", "photo", "draw", "generate", "illustration",
-        "render", "create a", "make a"
+        "render", "create a", "make a", "design"
     ])
 
-    print(f"[*] Image request detected: {is_image_request}")
+    print(f"[*] Image request: {is_image_request}")
     print("[*] Launching CloakBrowser...")
     browser = launch(headless=True)
     page = browser.new_page()
-    page.on("request", on_request)
-    page.on("response", on_response)
 
     print("[*] Navigating to duck.ai...")
     page.goto(DDG_URL, wait_until="domcontentloaded", timeout=60000)
@@ -210,7 +212,7 @@ def send_chat_via_browser(message):
             el = page.locator(sel)
             if el.count() > 0 and el.first.is_visible():
                 chat_input = el.first
-                print(f"[+] Found chat input: {sel}")
+                print(f"[+] Found input: {sel}")
                 break
         except Exception:
             pass
@@ -218,10 +220,8 @@ def send_chat_via_browser(message):
     if not chat_input:
         print("[*] Fallback textarea search...")
         try:
-            info = page.evaluate("""
-                () => document.querySelectorAll('textarea').length
-            """)
-            for i in range(info):
+            count = page.evaluate("() => document.querySelectorAll('textarea').length")
+            for i in range(count):
                 ta = page.locator('textarea').nth(i)
                 if ta.is_visible():
                     chat_input = ta
@@ -243,35 +243,40 @@ def send_chat_via_browser(message):
     print("[*] Submitting...")
     page.keyboard.press("Enter")
 
-    # Wait for response (longer for image requests)
-    wait_time = 60 if is_image_request else 30
-    print(f"[*] Waiting up to {wait_time}s for response...")
+    # Wait for response (longer for images)
+    wait_time = 90 if is_image_request else 30
+    print(f"[*] Waiting up to {wait_time}s...")
 
     last_text = ""
-    last_images = []
+    last_image_count = 0
     stable_count = 0
 
     for i in range(int(wait_time / 2.5)):
         time.sleep(2.5)
 
         text = extract_text_response(page, message)
-        dom_images = extract_images_from_dom(page)
+        images = extract_images_from_page(page)
 
-        all_images = list(set(captured_images + dom_images))
+        img_count = len(images)
 
-        if text or all_images:
-            if text == last_text and all_images == last_images:
+        if text or img_count > 0:
+            text_changed = text != last_text
+            images_changed = img_count != last_image_count
+
+            if not text_changed and not images_changed:
                 stable_count += 1
-                if stable_count >= 3:  # 7.5s stable
-                    print(f"[+] Response stabilized at {(i+1)*2.5}s")
+                if stable_count >= 4:  # 10s stable
+                    print(f"[+] Stable at {(i+1)*2.5}s: {len(text)} chars, {img_count} images")
                     break
             else:
                 stable_count = 0
                 last_text = text
-                last_images = all_images
+                last_image_count = img_count
                 if i % 2 == 0:
-                    print(f"[*] Growing... text={len(text)} chars, images={len(all_images)}")
+                    print(f"[*] Growing: {len(text)} chars, {img_count} images")
 
+    # Extract final images
+    final_images = extract_images_from_page(page)
     page.screenshot(path="/tmp/ddg_final.png")
     browser.close()
 
@@ -281,19 +286,35 @@ def send_chat_via_browser(message):
     # Clean text
     if last_text:
         text = last_text.strip()
-        # Remove UI noise
         for noise in ["GPT-5 mini", "Fast", "Tools", "Hide Reasoning",
-                       "Related Searches", "All chats are private", "AI can make mistakes"]:
+                       "Related Searches", "All chats are private", "AI can make mistakes",
+                       "Reasoning"]:
             text = text.replace(noise, "").strip()
-        # Remove leading/trailing newlines
         text = text.strip('\n').strip()
         if text:
             result["response"] = text
 
-    # Add images
-    if last_images:
-        result["images"] = last_images
-        result["type"] = "image"
+    # Upload images to tmpfiles.org
+    if final_images:
+        print(f"[*] Uploading {len(final_images)} image(s) to tmpfiles.org...")
+        tmp_urls = []
+        for idx, img in enumerate(final_images):
+            img_data = img.get("data", "")
+            if img_data.startswith("data:image/"):
+                # Extract base64 from data URL
+                header, b64 = img_data.split(",", 1)
+                ext = "png" if "png" in header else "jpg"
+                try:
+                    img_bytes = base64.b64decode(b64)
+                    url = upload_to_tmpfiles(img_bytes, f"ddg_image_{idx}.{ext}")
+                    if url:
+                        tmp_urls.append(url)
+                except Exception as e:
+                    print(f"[!] Failed to decode image {idx}: {e}")
+
+        if tmp_urls:
+            result["images"] = tmp_urls
+            result["type"] = "image"
 
     if not result.get("response") and not result.get("images"):
         return {"error": "No response extracted"}
@@ -309,7 +330,7 @@ def main():
     result["status"] = "done" if result.get("status") == "success" else "error"
     redis_set(f"chat:{REQUEST_ID}", result, ttl=180)
     print(f"[+] Stored result for request {REQUEST_ID}")
-    print(f"[*] Result: {json.dumps(result)[:300]}")
+    print(f"[*] Result: {json.dumps(result)[:500]}")
 
 
 if __name__ == "__main__":
