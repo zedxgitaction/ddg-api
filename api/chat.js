@@ -53,6 +53,10 @@ export default async function handler(req, res) {
     messages: [{ role: "user", content: msg }],
   };
 
+  // Generate fresh journey-id (consumed per request)
+  const crypto = await import("crypto");
+  const journeyId = crypto.randomUUID().replace(/-/g, "");
+
   const ddgHeaders = {
     "Content-Type": "application/json",
     accept: "text/event-stream",
@@ -60,7 +64,7 @@ export default async function handler(req, res) {
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
     "x-fe-version": headers["x-fe-version"],
     "x-fe-signals": headers["x-fe-signals"],
-    "x-ddg-journey-id": headers["x-ddg-journey-id"],
+    "x-ddg-journey-id": journeyId,
     Origin: "https://duck.ai",
     Referer: "https://duck.ai/",
   };
