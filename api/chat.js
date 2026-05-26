@@ -1,11 +1,13 @@
-// Vercel Serverless Function: DDG AI Chat + Image Edit API
+// Vercel Serverless Function: DDG AI Chat + Image Edit + Image Gen API
 //
-// POST /api/chat        { "message": "hello" }                          → { status: "triggered", request_id }
-// POST /api/chat/result { "id": "xxx" }                                 → polls Redis for chat result
-// POST /api/chat/reply  { "id": "xxx", "message": "yes" }              → send reply to multi-turn conversation
-// POST /api/edit        { "image_url": "url", "prompt": "edit this" }   → { status: "triggered", request_id }
-// POST /api/edit/result { "id": "xxx" }                                 → polls Redis for edit result
-// POST /api/edit/reply  { "id": "xxx", "message": "yes" }              → send reply to multi-turn edit conversation
+// POST /api/chat         { "message": "hello" }                          → { status: "triggered", request_id }
+// POST /api/chat/result  { "id": "xxx" }                                 → polls Redis for chat result
+// POST /api/chat/reply   { "id": "xxx", "message": "yes" }              → send reply to multi-turn conversation
+// POST /api/edit         { "image_url": "url", "prompt": "edit this" }   → { status: "triggered", request_id }
+// POST /api/edit/result  { "id": "xxx" }                                 → polls Redis for edit result
+// POST /api/edit/reply   { "id": "xxx", "message": "yes" }              → send reply to multi-turn edit conversation
+// POST /api/image        { "prompt": "a cat" }                           → { status: "triggered", request_id }
+// POST /api/image/result { "id": "xxx" }                                 → polls Redis for image result
 //
 // GH Actions (CloakBrowser) handles the actual DDG request to bypass IP blocking.
 
@@ -76,7 +78,7 @@ async function triggerWorkflow(workflow, inputs) {
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") {
@@ -153,6 +155,47 @@ export default async function handler(req, res) {
       });
     }
     return res.status(200).json(data);
+  }
+
+  // ─── IMAGE RESULT POLL ───
+  if (url.includes("/image/result")) {
+    const id = body.id;
+    if (!id) return res.status(400).json({ error: 'Missing "id" in request body' });
+
+    const data = await redisGet(`result:${id}`);
+    if (!data) {
+      return res.status(200).json({
+        status: "waiting",
+        message: "Image still processing or expired. GH Actions takes ~60-90s.",
+      });
+    }
+    return res.status(200).json(data);
+  }
+
+  // ─── IMAGE GEN TRIGGER ───
+  if (url.includes("/image")) {
+    const prompt = body.prompt;
+    if (!prompt) return res.status(400).json({ error: 'Missing "prompt" in request body' });
+
+    if (!GH_PAT) return res.status(500).json({ error: "GH_PAT not configured" });
+
+    const requestId = randomId();
+    await redisSet(`result:${requestId}`, { status: "queued" }, 600);
+
+    const triggered = await triggerWorkflow("proxy-image.yml", {
+      prompt,
+      request_id: requestId,
+    });
+
+    if (!triggered) {
+      return res.status(500).json({ error: "Failed to trigger GH Actions workflow" });
+    }
+
+    return res.status(200).json({
+      status: "triggered",
+      request_id: requestId,
+      note: 'POST to /api/image/result with { "id": "<request_id>" } to get the image.',
+    });
   }
 
   // ─── IMAGE EDIT TRIGGER ───

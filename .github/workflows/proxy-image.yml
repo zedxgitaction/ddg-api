@@ -1,0 +1,43 @@
+name: Proxy DDG Image Gen
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Image generation prompt'
+        required: true
+        type: string
+      request_id:
+        description: 'Unique request ID for response retrieval'
+        required: true
+        type: string
+
+jobs:
+  proxy-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install CloakBrowser binary (with retry)
+        run: |
+          for i in 1 2 3; do
+            echo "Attempt $i to install CloakBrowser..."
+            python -m cloakbrowser install && break
+            echo "Attempt $i failed, retrying in 5s..."
+            sleep 5
+          done
+
+      - name: Generate image via duck.ai
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          IMAGE_PROMPT: ${{ inputs.prompt }}
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: python scripts/proxy_image.py

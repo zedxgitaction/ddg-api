@@ -27,6 +27,14 @@
       "dest": "api/chat.js"
     },
     {
+      "src": "/api/image/result",
+      "dest": "api/chat.js"
+    },
+    {
+      "src": "/api/image",
+      "dest": "api/chat.js"
+    },
+    {
       "src": "/api/chat",
       "dest": "api/chat.js"
     }
