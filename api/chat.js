@@ -2,8 +2,10 @@
 //
 // POST /api/chat        { "message": "hello" }                          → { status: "triggered", request_id }
 // POST /api/chat/result { "id": "xxx" }                                 → polls Redis for chat result
+// POST /api/chat/reply  { "id": "xxx", "message": "yes" }              → send reply to multi-turn conversation
 // POST /api/edit        { "image_url": "url", "prompt": "edit this" }   → { status: "triggered", request_id }
 // POST /api/edit/result { "id": "xxx" }                                 → polls Redis for edit result
+// POST /api/edit/reply  { "id": "xxx", "message": "yes" }              → send reply to multi-turn edit conversation
 //
 // GH Actions (CloakBrowser) handles the actual DDG request to bypass IP blocking.
 
@@ -87,6 +89,36 @@ export default async function handler(req, res) {
 
   const body = parseBody(req);
   const url = req.url || "";
+
+  // ─── CHAT REPLY (multi-turn) ───
+  if (url.includes("/chat/reply")) {
+    const id = body.id;
+    const msg = body.message;
+    if (!id) return res.status(400).json({ error: 'Missing "id" in request body' });
+    if (!msg) return res.status(400).json({ error: 'Missing "message" in request body' });
+
+    await redisSet(`reply:${id}`, { message: msg }, 120);
+    return res.status(200).json({
+      status: "reply_sent",
+      request_id: id,
+      message: "Reply stored. The script will send it to duck.ai shortly. Poll /api/chat/result for the final response.",
+    });
+  }
+
+  // ─── EDIT REPLY (multi-turn) ───
+  if (url.includes("/edit/reply")) {
+    const id = body.id;
+    const msg = body.message;
+    if (!id) return res.status(400).json({ error: 'Missing "id" in request body' });
+    if (!msg) return res.status(400).json({ error: 'Missing "message" in request body' });
+
+    await redisSet(`reply:${id}`, { message: msg }, 120);
+    return res.status(200).json({
+      status: "reply_sent",
+      request_id: id,
+      message: "Reply stored. The script will send it to duck.ai shortly. Poll /api/edit/result for the final response.",
+    });
+  }
 
   // ─── CHAT RESULT POLL ───
   if (url.includes("/chat/result")) {

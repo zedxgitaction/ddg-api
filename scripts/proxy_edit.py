@@ -1,7 +1,9 @@
 """
 CloakBrowser proxy for image editing via duck.ai.
-Downloads image from URL, attaches to duck.ai chat, sends edit prompt.
-Extracts only the edited image (no text), uploads to tmpfiles.org.
+Multi-turn: sends edit prompt, waits for response. If duck.ai responds with text
+(confirmation/question), stores as needs_reply in Redis and polls for user reply.
+When reply arrives, sends it to same session and captures the final image.
+Base64 images are uploaded to tmpfiles.org.
 """
 import json
 import os
@@ -45,11 +47,23 @@ def redis_set(key, value, ttl=300):
     return r.status_code == 200
 
 
-def upload_to_tmpfiles(image_bytes, filename="image.png"):
-    """Upload to tmpfiles.org with retry, fallback to 0x0.st."""
-    import time as _time
+def redis_get(key):
+    try:
+        r = requests.get(
+            f"{UPSTASH_URL}/get/{key}",
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+            timeout=10,
+        )
+        data = r.json()
+        if data.get("result"):
+            return json.loads(data["result"])
+    except Exception:
+        pass
+    return None
 
-    # Try tmpfiles.org first (with retries)
+
+def upload_to_tmpfiles(image_bytes, filename="image.png"):
+    """Upload to tmpfiles.org with retry, fallback to file.io."""
     for attempt in range(3):
         try:
             r = requests.post(
@@ -67,27 +81,9 @@ def upload_to_tmpfiles(image_bytes, filename="image.png"):
         except Exception as e:
             print(f"[!] tmpfiles upload failed (attempt {attempt+1}): {e}")
         if attempt < 2:
-            _time.sleep(2)
+            time.sleep(2)
 
-    # Fallback: 0x0.st
-    try:
-        print("[*] Falling back to 0x0.st...")
-        ext = filename.rsplit(".", 1)[-1] if "." in filename else "png"
-        mime = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
-        r = requests.post(
-            "https://0x0.st",
-            files={"file": (filename, image_bytes, mime)},
-            timeout=30,
-        )
-        if r.status_code == 200 and r.text.strip().startswith("http"):
-            url = r.text.strip()
-            print(f"[+] Uploaded to 0x0.st: {url}")
-            return url
-        print(f"[!] 0x0.st response: {r.status_code} {r.text[:200]}")
-    except Exception as e:
-        print(f"[!] 0x0.st upload failed: {e}")
-
-    # Fallback 2: file.io
+    # Fallback: file.io
     try:
         print("[*] Falling back to file.io...")
         r = requests.post(
@@ -106,15 +102,30 @@ def upload_to_tmpfiles(image_bytes, filename="image.png"):
     return None
 
 
+def fix_tmpfiles_url(url):
+    """Convert tmpfiles.org page URL to direct download URL."""
+    if "tmpfiles.org/" in url and "/dl/" not in url:
+        url = url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+        print(f"[*] Fixed tmpfiles URL to: {url}")
+    return url
+
+
 def download_image(url):
     """Download image from URL, return bytes."""
+    url = fix_tmpfiles_url(url)
     try:
         print(f"[*] Downloading image: {url[:100]}")
         r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code == 200 and len(r.content) > 1000:
-            print(f"[+] Downloaded: {len(r.content)} bytes")
+        ct = r.headers.get("content-type", "")
+        if r.status_code == 200 and len(r.content) > 1000 and "image" in ct:
+            print(f"[+] Downloaded: {len(r.content)} bytes, type={ct}")
             return r.content
-        print(f"[!] Download failed: status={r.status_code}, size={len(r.content)}")
+        if r.status_code == 200 and len(r.content) > 5000:
+            header = r.content[:8]
+            if header[:4] == b'\xff\xd8\xff\xe0' or header[:4] == b'\xff\xd8\xff\xe1' or header[:8] == b'\x89PNG\r\n\x1a\n':
+                print(f"[+] Downloaded (content-type wrong but data is image): {len(r.content)} bytes")
+                return r.content
+        print(f"[!] Download failed: status={r.status_code}, size={len(r.content)}, ct={ct}")
         return None
     except Exception as e:
         print(f"[!] Download error: {e}")
@@ -189,15 +200,93 @@ def extract_images_from_page(page):
     """)
 
 
+def get_last_response_text(page):
+    """Extract the last assistant message text from the page."""
+    try:
+        return page.evaluate("""
+            () => {
+                const selectors = [
+                    '[data-message-author-role="assistant"]',
+                    '[data-testid*="message"]',
+                    '[class*="Message"]',
+                    '[class*="message"]',
+                    '[class*="response"]',
+                    'article',
+                ];
+                for (const sel of selectors) {
+                    const els = document.querySelectorAll(sel);
+                    if (els.length > 0) {
+                        const text = els[els.length - 1].innerText.trim();
+                        if (text && text.length > 5) return text;
+                    }
+                }
+                return '';
+            }
+        """)
+    except Exception:
+        return ""
+
+
+def clean_text(text):
+    """Remove noise from duck.ai text responses."""
+    for noise in ["GPT-5 mini", "Fast", "Tools", "Hide Reasoning",
+                  "Related Searches", "All chats are private", "AI can make mistakes",
+                  "Reasoning"]:
+        text = text.replace(noise, "").strip()
+    return text.strip('\n').strip()
+
+
+def find_chat_input(page):
+    """Find the chat input textarea on the page."""
+    for sel in [
+        'textarea#chat-input',
+        'textarea[name="chat-input"]',
+        'textarea[aria-label*="chat" i]',
+        'textarea[aria-label*="message" i]',
+        'textarea[placeholder*="Ask" i]',
+        'textarea[placeholder*="message" i]',
+        'textarea[placeholder*="Type" i]',
+        'div[role="textbox"][contenteditable="true"]',
+    ]:
+        try:
+            el = page.locator(sel)
+            if el.count() > 0 and el.first.is_visible():
+                print(f"[+] Found input: {sel}")
+                return el.first
+        except Exception:
+            pass
+
+    try:
+        count = page.evaluate("() => document.querySelectorAll('textarea').length")
+        for i in range(count):
+            ta = page.locator('textarea').nth(i)
+            if ta.is_visible():
+                print(f"[+] Using textarea #{i}")
+                return ta
+    except Exception:
+        pass
+
+    return None
+
+
+def send_message(page, message):
+    """Type and send a message in the chat input."""
+    chat_input = find_chat_input(page)
+    if not chat_input:
+        return False
+    chat_input.click()
+    time.sleep(0.5)
+    chat_input.fill(message)
+    time.sleep(1)
+    page.keyboard.press("Enter")
+    print(f"[+] Sent message: {message[:80]}")
+    return True
+
+
 def craft_edit_prompt(prompt):
-    """
-    Craft a direct edit prompt that avoids DDG follow-up questions.
-    DDG tends to ask clarifying questions instead of editing. This forces
-    a direct edit response.
-    """
+    """Craft a direct edit prompt with CRITICAL suffix to reduce follow-up questions."""
     prompt = prompt.strip()
 
-    # Critical constraint suffix — forces duck.ai to edit immediately without questions
     CRITICAL_SUFFIX = (
         " CRITICAL API CONSTRAINT: Do not reply with text. Do not ask for clarification, "
         "preferences, style, or color choices. If any details are unspecified, make a creative "
@@ -205,7 +294,6 @@ def craft_edit_prompt(prompt):
         "only be the final edited image."
     )
 
-    # If prompt already includes clear instructions, keep it
     direct_starters = [
         "edit", "change", "modify", "transform", "convert", "turn",
         "make it", "add", "remove", "replace", "apply", "enhance",
@@ -218,11 +306,27 @@ def craft_edit_prompt(prompt):
 
 
 def upload_image_to_page(page, image_bytes):
-    """Try to upload image via file input or drag-and-drop."""
-    # Save image to /tmp for upload
-    tmp_path = "/tmp/ddg_edit_input.png"
+    """Try to upload image via file input or attachment button."""
+    ext = "png"
+    content_type = "image/png"
+    header = image_bytes[:8]
+    if header[:4] == b'\xff\xd8\xff\xe0' or header[:4] == b'\xff\xd8\xff\xe1':
+        ext = "jpg"
+        content_type = "image/jpeg"
+    elif header[:8] == b'\x89PNG\r\n\x1a\n':
+        ext = "png"
+        content_type = "image/png"
+    elif header[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
+        ext = "webp"
+        content_type = "image/webp"
+    elif header[:4] == b'GIF8':
+        ext = "gif"
+        content_type = "image/gif"
+
+    tmp_path = f"/tmp/ddg_edit_input.{ext}"
     with open(tmp_path, "wb") as f:
         f.write(image_bytes)
+    print(f"[*] Saved input image: {tmp_path} ({len(image_bytes)} bytes, {ext})")
 
     # Method 1: Try file input
     try:
@@ -235,7 +339,7 @@ def upload_image_to_page(page, image_bytes):
     except Exception as e:
         print(f"[*] File input method failed: {e}")
 
-    # Method 2: Try attachment button → file input
+    # Method 2: Try attachment button -> file input
     try:
         attach_selectors = [
             'button[aria-label*="attach" i]',
@@ -254,8 +358,6 @@ def upload_image_to_page(page, image_bytes):
                 print(f"[+] Clicking attachment: {sel}")
                 btn.first.click()
                 time.sleep(2)
-
-                # Now look for file input that appeared
                 file_inputs = page.locator('input[type="file"]')
                 if file_inputs.count() > 0:
                     print("[+] File input appeared after attachment click")
@@ -265,7 +367,7 @@ def upload_image_to_page(page, image_bytes):
     except Exception as e:
         print(f"[*] Attachment button method failed: {e}")
 
-    # Method 3: Inject file input and trigger
+    # Method 3: Inject file input
     try:
         print("[*] Trying injected file input...")
         page.evaluate("""
@@ -282,7 +384,6 @@ def upload_image_to_page(page, image_bytes):
         if injected.count() > 0:
             injected.first.set_input_files(tmp_path)
             time.sleep(1)
-            # Trigger change event
             page.evaluate("""
                 () => {
                     const input = document.getElementById('__ddg_upload');
@@ -299,6 +400,125 @@ def upload_image_to_page(page, image_bytes):
     return False
 
 
+def process_images(captured_images, extracted_images, pre_existing_urls):
+    """Process captured and extracted images, upload to tmpfiles.org."""
+    tmp_urls = []
+
+    # PRIORITY 1: Network-intercepted images (new only)
+    new_captured = [img for img in captured_images if img["url"] not in pre_existing_urls]
+    if new_captured:
+        print(f"[*] Processing {len(new_captured)} network-intercepted image(s)...")
+        for idx, img in enumerate(new_captured):
+            ct = img["content_type"]
+            ext = "png"
+            if "jpeg" in ct or "jpg" in ct: ext = "jpg"
+            elif "webp" in ct: ext = "webp"
+            elif "gif" in ct: ext = "gif"
+            url = upload_to_tmpfiles(img["body"], f"ddg_edit_{idx}.{ext}")
+            if url:
+                tmp_urls.append(url)
+
+    # PRIORITY 2: DOM-extracted new images
+    if not tmp_urls:
+        new_dom = [img for img in extracted_images
+                   if img.get("type") != "url" or img["data"] not in pre_existing_urls]
+        if new_dom:
+            print(f"[*] Processing {len(new_dom)} DOM image(s)...")
+            for idx, img in enumerate(new_dom):
+                img_data = img.get("data", "")
+                img_type = img.get("type", "")
+                try:
+                    if img_type == "blob_bytes" and isinstance(img_data, list):
+                        img_bytes = bytes(img_data)
+                        url = upload_to_tmpfiles(img_bytes, f"ddg_edit_{idx}.png")
+                        if url:
+                            tmp_urls.append(url)
+                    elif isinstance(img_data, str) and img_data.startswith("data:image/"):
+                        header, b64 = img_data.split(",", 1)
+                        ext = "png" if "png" in header else "jpg"
+                        img_bytes = base64.b64decode(b64)
+                        url = upload_to_tmpfiles(img_bytes, f"ddg_edit_{idx}.{ext}")
+                        if url:
+                            tmp_urls.append(url)
+                    elif img_type == "url" and isinstance(img_data, str) and img_data.startswith("http"):
+                        print(f"[*] Downloading: {img_data[:100]}")
+                        dl = requests.get(img_data, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+                        if dl.status_code == 200 and len(dl.content) > 1000:
+                            ct = dl.headers.get("content-type", "")
+                            ext = "png"
+                            if "jpeg" in ct or "jpg" in ct: ext = "jpg"
+                            elif "webp" in ct: ext = "webp"
+                            elif "gif" in ct: ext = "gif"
+                            url = upload_to_tmpfiles(dl.content, f"ddg_edit_{idx}.{ext}")
+                            if url:
+                                tmp_urls.append(url)
+                except Exception as e:
+                    print(f"[!] Failed to process image {idx}: {e}")
+
+    return tmp_urls
+
+
+def wait_for_images(page, captured_images, pre_existing_urls, timeout=90):
+    """Wait for images to appear and stabilize. Returns (images, text_response)."""
+    last_count = 0
+    stable = 0
+    text_response = ""
+
+    for i in range(int(timeout / 2.5)):
+        time.sleep(2.5)
+
+        dom_images = extract_images_from_page(page)
+        new_dom = [img for img in dom_images
+                   if img.get("type") != "url" or img["data"] not in pre_existing_urls]
+        new_cap = [img for img in captured_images if img["url"] not in pre_existing_urls]
+        total = len(new_dom) + len(new_cap)
+
+        if total > 0:
+            if total == last_count:
+                stable += 1
+                if stable >= 4:
+                    print(f"[+] Images stable at {(i+1)*2.5}s: {total} images")
+                    return dom_images, ""
+            else:
+                stable = 0
+                last_count = total
+                if i % 2 == 0:
+                    print(f"[*] Growing: {total} images")
+        else:
+            elapsed = (i + 1) * 2.5
+            if elapsed >= 15:
+                text = get_last_response_text(page)
+                if text and len(text) > 10:
+                    print(f"[*] Got text response ({len(text)} chars)")
+                    text_response = text
+                    return [], text_response
+
+            if elapsed >= timeout:
+                print(f"[*] Timeout after {timeout}s")
+                break
+
+    return extract_images_from_page(page), text_response
+
+
+def poll_for_reply(request_id, timeout=120):
+    """Poll Redis for user reply. Returns reply message or None."""
+    print(f"[*] Polling for reply (up to {timeout}s)...")
+    redis_set(f"chat:{REQUEST_ID}", {"status": "needs_reply", "request_id": request_id}, ttl=300)
+
+    for i in range(int(timeout / 3)):
+        time.sleep(3)
+        data = redis_get(f"reply:{request_id}")
+        if data and data.get("message"):
+            print(f"[+] Got reply: {data['message'][:80]}")
+            return data["message"]
+        elapsed = (i + 1) * 3
+        if elapsed % 30 == 0:
+            print(f"[*] Still waiting for reply... ({elapsed}s)")
+
+    print("[*] Reply timeout")
+    return None
+
+
 def send_edit_via_browser(image_url, edit_prompt):
     proxy_url = get_random_proxy()
     print(f"[*] Proxy: {proxy_url[:40]}...")
@@ -308,7 +528,7 @@ def send_edit_via_browser(image_url, edit_prompt):
     # Download the image first
     image_bytes = download_image(image_url)
     if not image_bytes:
-        return {"error": "Failed to download image from URL"}
+        return {"error": "Failed to download image from URL", "status": "error"}
 
     print("[*] Launching CloakBrowser...")
     browser = launch(headless=True)
@@ -316,7 +536,6 @@ def send_edit_via_browser(image_url, edit_prompt):
 
     # Network-level image capture
     captured_images = []
-    # Track images we already saw (to detect NEW edited images)
     pre_existing_image_urls = set()
 
     def on_response(response):
@@ -353,7 +572,7 @@ def send_edit_via_browser(image_url, edit_prompt):
 
     time.sleep(3)
 
-    # Snapshot existing images before uploading (to detect new ones later)
+    # Snapshot existing images before uploading
     pre_images = extract_images_from_page(page)
     for img in pre_images:
         if img.get("type") == "url":
@@ -364,7 +583,6 @@ def send_edit_via_browser(image_url, edit_prompt):
     uploaded = upload_image_to_page(page, image_bytes)
 
     if not uploaded:
-        # Fallback: send image URL in the prompt text
         print("[!] Direct upload failed, sending URL in prompt text")
         crafted = craft_edit_prompt(edit_prompt)
         final_message = f"{crafted}\n\nImage URL: {image_url}"
@@ -373,241 +591,59 @@ def send_edit_via_browser(image_url, edit_prompt):
         crafted = craft_edit_prompt(edit_prompt)
         final_message = crafted
 
-    # Find chat input
-    chat_input = None
-    for sel in [
-        'textarea#chat-input',
-        'textarea[name="chat-input"]',
-        'textarea[aria-label*="chat" i]',
-        'textarea[aria-label*="message" i]',
-        'textarea[placeholder*="Ask" i]',
-        'textarea[placeholder*="message" i]',
-        'textarea[placeholder*="Type" i]',
-        'div[role="textbox"][contenteditable="true"]',
-    ]:
-        try:
-            el = page.locator(sel)
-            if el.count() > 0 and el.first.is_visible():
-                chat_input = el.first
-                print(f"[+] Found input: {sel}")
-                break
-        except Exception:
-            pass
-
-    if not chat_input:
-        print("[*] Fallback textarea search...")
-        try:
-            count = page.evaluate("() => document.querySelectorAll('textarea').length")
-            for i in range(count):
-                ta = page.locator('textarea').nth(i)
-                if ta.is_visible():
-                    chat_input = ta
-                    print(f"[+] Using textarea #{i}")
-                    break
-        except Exception:
-            pass
-
-    if not chat_input:
+    # Send message
+    if not send_message(page, final_message):
         browser.close()
-        return {"error": "Could not find chat input"}
+        return {"error": "Could not find chat input", "status": "error"}
 
-    # Type and submit
-    print(f"[*] Typing: {final_message[:80]}")
-    chat_input.click()
-    time.sleep(0.5)
-    chat_input.fill(final_message)
-    time.sleep(1)
-    print("[*] Submitting...")
-    page.keyboard.press("Enter")
+    # Wait for response
+    print(f"[*] Waiting up to 90s for edited image...")
+    dom_images, text_response = wait_for_images(page, captured_images, pre_existing_image_urls, timeout=90)
 
-    # Wait for response - images only
-    # If DDG responds with text (follow-up question), send a follow-up prompt
-    wait_time = 120
-    print(f"[*] Waiting up to {wait_time}s for edited image...")
+    # If we got text (duck.ai asking a question), do multi-turn
+    if text_response and not dom_images:
+        print("[*] duck.ai responded with text — entering multi-turn mode")
 
-    last_image_count = 0
-    stable_count = 0
-    followup_sent = False
-    followup2_sent = False
+        clean = clean_text(text_response)
 
-    def get_last_response_text():
-        try:
-            return page.evaluate("""
-                () => {
-                    const selectors = [
-                        '[data-message-author-role="assistant"]',
-                        '[data-testid*="message"]',
-                        '[class*="Message"]',
-                        '[class*="message"]',
-                        '[class*="response"]',
-                        'article',
-                    ];
-                    for (const sel of selectors) {
-                        const els = document.querySelectorAll(sel);
-                        if (els.length > 0) {
-                            const text = els[els.length - 1].innerText.trim();
-                            if (text && text.length > 5) return text;
-                        }
-                    }
-                    return '';
-                }
-            """)
-        except Exception:
-            return ""
+        redis_set(f"chat:{REQUEST_ID}", {
+            "status": "needs_reply",
+            "text": clean,
+            "request_id": REQUEST_ID,
+        }, ttl=300)
 
-    def send_followup(msg):
-        try:
-            ci = None
-            for sel in [
-                'textarea#chat-input',
-                'textarea[name="chat-input"]',
-                'textarea[aria-label*="chat" i]',
-                'textarea[placeholder*="Ask" i]',
-                'div[role="textbox"][contenteditable="true"]',
-            ]:
-                el = page.locator(sel)
-                if el.count() > 0 and el.first.is_visible():
-                    ci = el.first
-                    break
-            if not ci:
-                ci = page.locator('textarea').first
-            if ci:
-                ci.click()
-                time.sleep(0.3)
-                ci.fill(msg)
-                time.sleep(0.5)
-                page.keyboard.press("Enter")
-                print(f"[+] Sent followup: {msg}")
-                return True
-        except Exception as e:
-            print(f"[!] Followup failed: {e}")
-        return False
+        reply = poll_for_reply(REQUEST_ID, timeout=120)
+        if not reply:
+            browser.close()
+            return {
+                "status": "needs_reply",
+                "text": clean,
+                "request_id": REQUEST_ID,
+                "error": "No reply received within 120s. Send a reply via /api/edit/reply.",
+            }
 
-    for i in range(int(wait_time / 2.5)):
-        time.sleep(2.5)
+        if not send_message(page, reply):
+            browser.close()
+            return {"error": "Could not send reply to duck.ai", "status": "error"}
 
-        images = extract_images_from_page(page)
-        new_images = [img for img in images
-                      if img.get("type") != "url" or img["data"] not in pre_existing_image_urls]
-        total_new = len(new_images) + len(captured_images)
+        print(f"[*] Waiting up to 90s for images after reply...")
+        dom_images, _ = wait_for_images(page, captured_images, pre_existing_image_urls, timeout=90)
 
-        if total_new > 0:
-            if total_new == last_image_count:
-                stable_count += 1
-                if stable_count >= 4:
-                    print(f"[+] Images stable at {(i+1)*2.5}s: {total_new} new images")
-                    break
-            else:
-                stable_count = 0
-                last_image_count = total_new
-                if i % 2 == 0:
-                    print(f"[*] Growing: {total_new} new images")
-        else:
-            elapsed = (i + 1) * 2.5
-
-            # After 20s with no images, check if DDG sent a text follow-up question
-            if elapsed >= 20 and not followup_sent:
-                text = get_last_response_text()
-                if text and len(text) > 10:
-                    print(f"[*] DDG responded with text ({len(text)} chars) — sending followup")
-                    followup_sent = True
-                    send_followup("Do not reply with text. Generate and show only the final edited image now. No questions.")
-                    continue
-
-            # After 50s with no images, try one more followup
-            if elapsed >= 50 and followup_sent and not followup2_sent:
-                text = get_last_response_text()
-                if text and len(text) > 10:
-                    print(f"[*] Still no images after followup, trying again")
-                    followup2_sent = True
-                    send_followup("CRITICAL: No text. Output only the edited image. Execute the edit now.")
-                    continue
-
-            if elapsed >= 90:
-                print(f"[*] No new images after 90s, giving up")
-                break
-
-    # Final extraction
-    final_images = extract_images_from_page(page)
-    new_final = [img for img in final_images
-                 if img.get("type") != "url" or img["data"] not in pre_existing_image_urls]
-
-    # Screenshot for fallback
-    screenshot_bytes = None
-    try:
-        page.screenshot(path="/tmp/ddg_edit_final.png", full_page=True)
-        with open("/tmp/ddg_edit_final.png", "rb") as f:
-            screenshot_bytes = f.read()
-        print(f"[*] Screenshot: {len(screenshot_bytes)} bytes")
-    except Exception as e:
-        print(f"[!] Screenshot failed: {e}")
     browser.close()
 
-    # Build result - images only, no text
-    result = {"status": "success", "type": "image", "proxy": proxy_url[:40]}
+    # Process images
+    tmp_urls = process_images(captured_images, dom_images, pre_existing_image_urls)
 
-    tmp_urls = []
-
-    # PRIORITY 1: Network-intercepted images (new ones only)
-    new_captured = [img for img in captured_images
-                    if img["url"] not in pre_existing_image_urls]
-    if new_captured:
-        print(f"[*] Processing {len(new_captured)} network-intercepted image(s)...")
-        for idx, img in enumerate(new_captured):
-            ct = img["content_type"]
-            ext = "png"
-            if "jpeg" in ct or "jpg" in ct: ext = "jpg"
-            elif "webp" in ct: ext = "webp"
-            elif "gif" in ct: ext = "gif"
-            url = upload_to_tmpfiles(img["body"], f"ddg_edit_{idx}.{ext}")
-            if url:
-                tmp_urls.append(url)
-
-    # PRIORITY 2: DOM-extracted new images
-    if not tmp_urls and new_final:
-        print(f"[*] No network images, falling back to {len(new_final)} DOM image(s)...")
-        for idx, img in enumerate(new_final):
-            img_data = img.get("data", "")
-            img_type = img.get("type", "")
-            try:
-                if img_type == "blob_bytes" and isinstance(img_data, list):
-                    img_bytes = bytes(img_data)
-                    url = upload_to_tmpfiles(img_bytes, f"ddg_edit_{idx}.png")
-                    if url:
-                        tmp_urls.append(url)
-                elif isinstance(img_data, str) and img_data.startswith("data:image/"):
-                    header, b64 = img_data.split(",", 1)
-                    ext = "png" if "png" in header else "jpg"
-                    img_bytes = base64.b64decode(b64)
-                    url = upload_to_tmpfiles(img_bytes, f"ddg_edit_{idx}.{ext}")
-                    if url:
-                        tmp_urls.append(url)
-                elif img_type == "url" and isinstance(img_data, str) and img_data.startswith("http"):
-                    print(f"[*] Downloading: {img_data[:100]}")
-                    dl = requests.get(img_data, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-                    if dl.status_code == 200 and len(dl.content) > 1000:
-                        ct = dl.headers.get("content-type", "")
-                        ext = "png"
-                        if "jpeg" in ct or "jpg" in ct: ext = "jpg"
-                        elif "webp" in ct: ext = "webp"
-                        elif "gif" in ct: ext = "gif"
-                        url = upload_to_tmpfiles(dl.content, f"ddg_edit_{idx}.{ext}")
-                        if url:
-                            tmp_urls.append(url)
-            except Exception as e:
-                print(f"[!] Failed to process image {idx}: {e}")
+    result = {"status": "done", "type": "image", "proxy": proxy_url[:40]}
 
     if tmp_urls:
         result["images"] = tmp_urls
-
-    # Fallback: screenshot
-    if not result.get("images") and screenshot_bytes and len(screenshot_bytes) > 5000:
-        print("[*] No images found, uploading screenshot as fallback...")
-        url = upload_to_tmpfiles(screenshot_bytes, "ddg_edit_screenshot.png")
-        if url:
-            result["images"] = [url]
-
-    if not result.get("images"):
+    elif text_response:
+        clean = clean_text(text_response)
+        if clean:
+            result["response"] = clean
+            result["type"] = "text"
+    else:
         result["error"] = "No edited images generated"
 
     return result
@@ -621,7 +657,7 @@ def main():
     else:
         result = send_edit_via_browser(IMAGE_URL, EDIT_PROMPT)
 
-    result["status"] = "done" if result.get("status") == "success" else "error"
+    result["status"] = "done" if result.get("status") == "done" else "error"
     redis_set(f"chat:{REQUEST_ID}", result, ttl=300)
     print(f"[+] Stored result for request {REQUEST_ID}")
     print(f"[*] Result: {json.dumps(result)[:500]}")
