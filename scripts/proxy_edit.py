@@ -46,23 +46,64 @@ def redis_set(key, value, ttl=300):
 
 
 def upload_to_tmpfiles(image_bytes, filename="image.png"):
+    """Upload to tmpfiles.org with retry, fallback to 0x0.st."""
+    import time as _time
+
+    # Try tmpfiles.org first (with retries)
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                "https://tmpfiles.org/api/v1/upload",
+                files={"file": (filename, image_bytes, "image/png")},
+                timeout=30,
+            )
+            data = r.json()
+            if data.get("status") == "success" and data.get("data", {}).get("url"):
+                url = data["data"]["url"]
+                direct = url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+                print(f"[+] Uploaded to tmpfiles: {direct}")
+                return direct
+            print(f"[!] tmpfiles response (attempt {attempt+1}): {data}")
+        except Exception as e:
+            print(f"[!] tmpfiles upload failed (attempt {attempt+1}): {e}")
+        if attempt < 2:
+            _time.sleep(2)
+
+    # Fallback: 0x0.st
     try:
+        print("[*] Falling back to 0x0.st...")
+        ext = filename.rsplit(".", 1)[-1] if "." in filename else "png"
+        mime = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
         r = requests.post(
-            "https://tmpfiles.org/api/v1/upload",
+            "https://0x0.st",
+            files={"file": (filename, image_bytes, mime)},
+            timeout=30,
+        )
+        if r.status_code == 200 and r.text.strip().startswith("http"):
+            url = r.text.strip()
+            print(f"[+] Uploaded to 0x0.st: {url}")
+            return url
+        print(f"[!] 0x0.st response: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print(f"[!] 0x0.st upload failed: {e}")
+
+    # Fallback 2: file.io
+    try:
+        print("[*] Falling back to file.io...")
+        r = requests.post(
+            "https://file.io",
             files={"file": (filename, image_bytes, "image/png")},
             timeout=30,
         )
         data = r.json()
-        if data.get("status") == "success" and data.get("data", {}).get("url"):
-            url = data["data"]["url"]
-            direct = url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
-            print(f"[+] Uploaded: {direct}")
-            return direct
-        print(f"[!] tmpfiles response: {data}")
-        return None
+        if data.get("link"):
+            print(f"[+] Uploaded to file.io: {data['link']}")
+            return data["link"]
+        print(f"[!] file.io response: {data}")
     except Exception as e:
-        print(f"[!] tmpfiles upload failed: {e}")
-        return None
+        print(f"[!] file.io upload failed: {e}")
+
+    return None
 
 
 def download_image(url):
