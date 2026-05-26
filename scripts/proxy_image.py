@@ -222,13 +222,46 @@ def extract_images_from_page(page):
 
 
 def send_image_request_via_browser(prompt):
-    proxy_url = get_random_proxy()
-    print(f"[*] Using proxy: {proxy_url[:40]}...")
-    print(f"[*] Image prompt: {prompt[:80]}")
-
     # Mark as processing in Redis
     redis_set(f"result:{REQUEST_ID}", {"status": "processing"}, 600)
 
+    proxies_tried = set()
+    max_attempts = min(len(PROXIES), 4)
+
+    for attempt in range(max_attempts):
+        # Pick a proxy we haven't tried yet
+        available = [p for p in PROXIES if p not in proxies_tried]
+        if not available:
+            break
+        proxy_url = random.choice(available)
+        proxies_tried.add(proxy_url)
+        print(f"[*] Attempt {attempt + 1}/{max_attempts} — proxy: {proxy_url[:40]}...")
+        print(f"[*] Image prompt: {prompt[:80]}")
+
+        try:
+            result = _try_image_request(prompt, proxy_url)
+            if result and result.get("status") != "error":
+                return result
+            # If error was proxy-related, try next proxy
+            err = result.get("error", "") if result else "unknown"
+            if "ERR_INVALID_AUTH" in err or "ERR_PROXY" in err or "ERR_TUNNEL" in err or "net::" in err:
+                print(f"[!] Proxy failed: {err[:80]}, trying next...")
+                continue
+            # Non-proxy error, return it
+            return result
+        except Exception as e:
+            err_str = str(e)
+            print(f"[!] Attempt {attempt + 1} exception: {err_str[:80]}")
+            if "ERR_INVALID_AUTH" in err_str or "ERR_PROXY" in err_str or "net::" in err_str:
+                continue
+            return {"status": "error", "error": err_str}
+
+    final_err = {"status": "error", "error": "All proxies failed", "tried": list(proxies_tried)}
+    redis_set(f"result:{REQUEST_ID}", final_err, 300)
+    return final_err
+
+
+def _try_image_request(prompt, proxy_url):
     # Track network image responses
     captured_images = []
     pre_existing_urls = set()
@@ -505,9 +538,7 @@ def send_image_request_via_browser(prompt):
 
     except Exception as e:
         print(f"[!] Error: {e}")
-        err = {"status": "error", "error": str(e), "proxy": proxy_url[:40]}
-        redis_set(f"result:{REQUEST_ID}", err, 300)
-        return err
+        return {"status": "error", "error": str(e), "proxy": proxy_url[:40]}
     finally:
         try:
             browser.close()
