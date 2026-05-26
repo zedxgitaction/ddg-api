@@ -284,9 +284,15 @@ def send_chat_via_browser(message):
 
             if not text_changed and not images_changed:
                 stable_count += 1
-                if stable_count >= 4:  # 10s stable
-                    print(f"[+] Stable at {(i+1)*2.5}s: {len(text)} chars, {img_count} images")
-                    break
+                # For image requests, don't stabilize until we have at least 1 image
+                # OR we've waited at least 60s
+                if stable_count >= 4:
+                    if is_image_request and img_count == 0 and (i + 1) * 2.5 < 60:
+                        print(f"[*] Text stable but 0 images at {(i+1)*2.5}s, waiting...")
+                        stable_count = 0  # reset, keep waiting for image
+                    else:
+                        print(f"[+] Stable at {(i+1)*2.5}s: {len(text)} chars, {img_count} images")
+                        break
             else:
                 stable_count = 0
                 last_text = text
@@ -296,7 +302,16 @@ def send_chat_via_browser(message):
 
     # Extract final images
     final_images = extract_images_from_page(page)
-    page.screenshot(path="/tmp/ddg_final.png")
+
+    # Take screenshot and save for fallback
+    screenshot_bytes = None
+    try:
+        page.screenshot(path="/tmp/ddg_final.png", full_page=True)
+        with open("/tmp/ddg_final.png", "rb") as f:
+            screenshot_bytes = f.read()
+        print(f"[*] Screenshot: {len(screenshot_bytes)} bytes")
+    except Exception as e:
+        print(f"[!] Screenshot failed: {e}")
     browser.close()
 
     # Build result
@@ -356,6 +371,14 @@ def send_chat_via_browser(message):
 
         if tmp_urls:
             result["images"] = tmp_urls
+            result["type"] = "image"
+
+    # Fallback: if image request but no images extracted from DOM, upload screenshot
+    if is_image_request and not result.get("images") and screenshot_bytes and len(screenshot_bytes) > 5000:
+        print("[*] No DOM images found, uploading screenshot as fallback...")
+        url = upload_to_tmpfiles(screenshot_bytes, "ddg_screenshot.png")
+        if url:
+            result["images"] = [url]
             result["type"] = "image"
 
     if not result.get("response") and not result.get("images"):
