@@ -17,18 +17,6 @@ DDG_URL = "https://duck.ai"
 PROMPT = os.environ.get("IMAGE_PROMPT", "a cute cat")
 REQUEST_ID = os.environ.get("REQUEST_ID", "unknown")
 
-PROXIES = [
-    "http://purevpn0s8946341:8RXxgcU2MBumt8@px043005.pointtoserver.com:10780",
-    "http://purevpn0s12153504:1LTpwxbCJbEdXo@px043005.pointtoserver.com:10780",
-    "http://purevpn0s8946341:8RXxgcU2MBumt8@px031901.pointtoserver.com:10780",
-    "http://1351:IBd1Fk5CuUNZ@p101.squidproxies.com:9088",
-    "http://llewellynashleybowen:rNXaRJfNPN233zw@136.179.19.164:3128",
-]
-
-
-def get_random_proxy():
-    return random.choice(PROXIES)
-
 
 def redis_set(key, value, ttl=300):
     r = requests.post(
@@ -222,53 +210,25 @@ def extract_images_from_page(page):
 
 
 def send_image_request_via_browser(prompt):
+    print(f"[*] Image prompt: {prompt[:80]}")
+
     # Mark as processing in Redis
     redis_set(f"result:{REQUEST_ID}", {"status": "processing"}, 600)
 
-    proxies_tried = set()
-    max_attempts = min(len(PROXIES), 4)
-
-    for attempt in range(max_attempts):
-        # Pick a proxy we haven't tried yet
-        available = [p for p in PROXIES if p not in proxies_tried]
-        if not available:
-            break
-        proxy_url = random.choice(available)
-        proxies_tried.add(proxy_url)
-        print(f"[*] Attempt {attempt + 1}/{max_attempts} — proxy: {proxy_url[:40]}...")
-        print(f"[*] Image prompt: {prompt[:80]}")
-
-        try:
-            result = _try_image_request(prompt, proxy_url)
-            if result and result.get("status") != "error":
-                return result
-            # If error was proxy-related, try next proxy
-            err = result.get("error", "") if result else "unknown"
-            if "ERR_INVALID_AUTH" in err or "ERR_PROXY" in err or "ERR_TUNNEL" in err or "net::" in err:
-                print(f"[!] Proxy failed: {err[:80]}, trying next...")
-                continue
-            # Non-proxy error, return it
-            return result
-        except Exception as e:
-            err_str = str(e)
-            print(f"[!] Attempt {attempt + 1} exception: {err_str[:80]}")
-            if "ERR_INVALID_AUTH" in err_str or "ERR_PROXY" in err_str or "net::" in err_str:
-                continue
-            return {"status": "error", "error": err_str}
-
-    final_err = {"status": "error", "error": "All proxies failed", "tried": list(proxies_tried)}
-    redis_set(f"result:{REQUEST_ID}", final_err, 300)
-    return final_err
+    print("[*] Launching CloakBrowser (direct, no proxy)...")
+    result = _try_image_request(prompt)
+    if result and result.get("status") == "done":
+        redis_set(f"result:{REQUEST_ID}", result, 600)
+    return result
 
 
-def _try_image_request(prompt, proxy_url):
+def _try_image_request(prompt):
     # Track network image responses
     captured_images = []
     pre_existing_urls = set()
 
     browser = launch(
         headless=True,
-        proxy={"server": proxy_url},
     )
     context = browser.new_context(
         viewport={"width": 1280, "height": 1024},
@@ -512,7 +472,6 @@ def _try_image_request(prompt, proxy_url):
                 result_data = {
                     "status": "done",
                     "model": "gpt-5-mini",
-                    "proxy": proxy_url[:40],
                     "images": tmp_urls,
                     "type": "screenshot",
                     "note": "duck.ai did not generate an image. This is a screenshot of the conversation.",
@@ -521,13 +480,11 @@ def _try_image_request(prompt, proxy_url):
                 result_data = {
                     "status": "error",
                     "error": "No images captured and screenshot upload failed",
-                    "proxy": proxy_url[:40],
                 }
         else:
             result_data = {
                 "status": "done",
                 "model": "gpt-5-mini",
-                "proxy": proxy_url[:40],
                 "images": tmp_urls,
                 "type": "image",
             }
@@ -538,7 +495,7 @@ def _try_image_request(prompt, proxy_url):
 
     except Exception as e:
         print(f"[!] Error: {e}")
-        return {"status": "error", "error": str(e), "proxy": proxy_url[:40]}
+        return {"status": "error", "error": str(e)}
     finally:
         try:
             browser.close()
