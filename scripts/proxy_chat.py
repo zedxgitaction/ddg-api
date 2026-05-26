@@ -33,7 +33,7 @@ def get_random_proxy():
     return random.choice(PROXIES)
 
 
-def redis_set(key, value, ttl=180):
+def redis_set(key, value, ttl=300):
     r = requests.post(
         f"{UPSTASH_URL}/pipeline",
         headers={
@@ -449,12 +449,12 @@ def send_chat_via_browser(message):
 
 
 def main():
-    redis_set(f"chat:{REQUEST_ID}", {"status": "processing"}, ttl=180)
+    redis_set(f"chat:{REQUEST_ID}", {"status": "processing"}, ttl=300)
 
     result = send_chat_via_browser(MESSAGE)
 
     result["status"] = "done" if result.get("status") == "success" else "error"
-    redis_set(f"chat:{REQUEST_ID}", result, ttl=180)
+    redis_set(f"chat:{REQUEST_ID}", result, ttl=300)
     print(f"[+] Stored result for request {REQUEST_ID}")
     print(f"[*] Result: {json.dumps(result)[:500]}")
 

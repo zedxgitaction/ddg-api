@@ -32,7 +32,7 @@ def get_random_proxy():
     return random.choice(PROXIES)
 
 
-def redis_set(key, value, ttl=180):
+def redis_set(key, value, ttl=300):
     r = requests.post(
         f"{UPSTASH_URL}/pipeline",
         headers={
@@ -372,22 +372,74 @@ def send_edit_via_browser(image_url, edit_prompt):
     page.keyboard.press("Enter")
 
     # Wait for response - images only
-    wait_time = 120  # longer for edit operations
+    # If DDG responds with text (follow-up question), send a follow-up prompt
+    wait_time = 120
     print(f"[*] Waiting up to {wait_time}s for edited image...")
 
     last_image_count = 0
     stable_count = 0
+    followup_sent = False
+    followup2_sent = False
+
+    def get_last_response_text():
+        try:
+            return page.evaluate("""
+                () => {
+                    const selectors = [
+                        '[data-message-author-role="assistant"]',
+                        '[data-testid*="message"]',
+                        '[class*="Message"]',
+                        '[class*="message"]',
+                        '[class*="response"]',
+                        'article',
+                    ];
+                    for (const sel of selectors) {
+                        const els = document.querySelectorAll(sel);
+                        if (els.length > 0) {
+                            const text = els[els.length - 1].innerText.trim();
+                            if (text && text.length > 5) return text;
+                        }
+                    }
+                    return '';
+                }
+            """)
+        except Exception:
+            return ""
+
+    def send_followup(msg):
+        try:
+            ci = None
+            for sel in [
+                'textarea#chat-input',
+                'textarea[name="chat-input"]',
+                'textarea[aria-label*="chat" i]',
+                'textarea[placeholder*="Ask" i]',
+                'div[role="textbox"][contenteditable="true"]',
+            ]:
+                el = page.locator(sel)
+                if el.count() > 0 and el.first.is_visible():
+                    ci = el.first
+                    break
+            if not ci:
+                ci = page.locator('textarea').first
+            if ci:
+                ci.click()
+                time.sleep(0.3)
+                ci.fill(msg)
+                time.sleep(0.5)
+                page.keyboard.press("Enter")
+                print(f"[+] Sent followup: {msg}")
+                return True
+        except Exception as e:
+            print(f"[!] Followup failed: {e}")
+        return False
 
     for i in range(int(wait_time / 2.5)):
         time.sleep(2.5)
 
         images = extract_images_from_page(page)
-
-        # Filter out pre-existing images (only count NEW ones)
         new_images = [img for img in images
                       if img.get("type") != "url" or img["data"] not in pre_existing_image_urls]
-
-        # Also count network-captured images
         total_new = len(new_images) + len(captured_images)
 
         if total_new > 0:
@@ -402,7 +454,27 @@ def send_edit_via_browser(image_url, edit_prompt):
                 if i % 2 == 0:
                     print(f"[*] Growing: {total_new} new images")
         else:
-            if (i + 1) * 2.5 >= 90:
+            elapsed = (i + 1) * 2.5
+
+            # After 20s with no images, check if DDG sent a text follow-up question
+            if elapsed >= 20 and not followup_sent:
+                text = get_last_response_text()
+                if text and len(text) > 10:
+                    print(f"[*] DDG responded with text ({len(text)} chars) — sending followup")
+                    followup_sent = True
+                    send_followup("Just edit the image now. No questions, just do the edit.")
+                    continue
+
+            # After 50s with no images, try one more followup
+            if elapsed >= 50 and followup_sent and not followup2_sent:
+                text = get_last_response_text()
+                if text and len(text) > 10:
+                    print(f"[*] Still no images after followup, trying again")
+                    followup2_sent = True
+                    send_followup("Generate the edited image now. Apply the edit directly.")
+                    continue
+
+            if elapsed >= 90:
                 print(f"[*] No new images after 90s, giving up")
                 break
 

@@ -28,7 +28,7 @@ function parseBody(req) {
   }
 }
 
-async function redisSet(key, value, ttl = 180) {
+async function redisSet(key, value, ttl = 300) {
   const r = await fetch(`${UPSTASH_URL}/pipeline`, {
     method: "POST",
     headers: {
@@ -154,7 +154,7 @@ export default async function handler(req, res) {
   if (!GH_PAT) return res.status(500).json({ error: "GH_PAT not configured" });
 
   const requestId = randomId();
-  await redisSet(`chat:${requestId}`, { status: "queued" }, 180);
+  await redisSet(`chat:${requestId}`, { status: "queued" }, 300);
 
   const triggered = await triggerWorkflow("proxy-chat.yml", {
     message: msg,
