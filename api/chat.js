@@ -116,7 +116,7 @@ export default async function handler(req, res) {
 
   const requestId = randomId();
 
-  await redisSet(`chat:${requestId}`, { status: "queued" }, 120);
+  await redisSet(`chat:${requestId}`, { status: "queued" }, 180);
 
   const triggered = await triggerWorkflow(msg, requestId);
   if (!triggered) {
