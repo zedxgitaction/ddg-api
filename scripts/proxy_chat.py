@@ -1,11 +1,13 @@
 """
 Full CloakBrowser proxy: interact with duck.ai chat directly via browser.
 For images: extracts base64 from canvas/data-URLs, uploads to tmpfiles.org, returns URLs.
+Proxy rotation enabled for anti-detection.
 """
 import json
 import os
 import time
 import base64
+import random
 import requests
 from cloakbrowser import launch
 
@@ -15,6 +17,19 @@ DDG_URL = "https://duck.ai"
 
 MESSAGE = os.environ.get("CHAT_MESSAGE", "hello")
 REQUEST_ID = os.environ.get("REQUEST_ID", "unknown")
+
+# Working proxies for rotation
+PROXIES = [
+    "http://purevpn0s8946341:8RXxgcU2MBumt8@px043005.pointtoserver.com:10780",
+    "http://purevpn0s12153504:1LTpwxbCJbEdXo@px043005.pointtoserver.com:10780",
+    "http://purevpn0s8946341:8RXxgcU2MBumt8@px031901.pointtoserver.com:10780",
+    "http://1351:IBd1Fk5CuUNZ@p101.squidproxies.com:9088",
+    "http://llewellynashleybowen:rNXaRJfNPN233zw@136.179.19.164:3128",
+]
+
+
+def get_random_proxy():
+    return random.choice(PROXIES)
 
 
 def redis_set(key, value, ttl=180):
@@ -54,7 +69,6 @@ def upload_to_tmpfiles(image_bytes, filename="image.png"):
         )
         data = r.json()
         if data.get("status") == "success" and data.get("data", {}).get("url"):
-            # tmpfiles.org returns view URL, convert to direct download
             url = data["data"]["url"]
             direct = url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
             print(f"[+] Uploaded to tmpfiles: {direct}")
@@ -80,7 +94,7 @@ def extract_images_from_page(page):
                 }
             });
 
-            // 2. <img> tags with blob: URLs — fetch full binary (not canvas!)
+            // 2. <img> tags with blob: URLs — fetch full binary
             for (const img of document.querySelectorAll('img[src^="blob:"]')) {
                 try {
                     const resp = await fetch(img.src);
@@ -172,13 +186,16 @@ def send_chat_via_browser(message):
         "render", "create a", "make a", "design"
     ])
 
+    # Select random proxy
+    proxy = get_random_proxy()
+    print(f"[*] Using proxy: {proxy.split('@')[1] if '@' in proxy else proxy}")
     print(f"[*] Image request: {is_image_request}")
     print("[*] Launching CloakBrowser...")
-    browser = launch(headless=True)
+    browser = launch(headless=True, proxy={"server": proxy})
     page = browser.new_page()
 
-    # Network-level image capture (full resolution, no canvas quality loss)
-    captured_images = []  # list of {"url": str, "body": bytes, "content_type": str}
+    # Network-level image capture
+    captured_images = []
 
     def on_response(response):
         try:
@@ -262,7 +279,7 @@ def send_chat_via_browser(message):
     print("[*] Submitting...")
     page.keyboard.press("Enter")
 
-    # Wait for response (longer for images)
+    # Wait for response
     wait_time = 90 if is_image_request else 30
     print(f"[*] Waiting up to {wait_time}s...")
 
@@ -275,7 +292,6 @@ def send_chat_via_browser(message):
 
         text = extract_text_response(page, message)
         images = extract_images_from_page(page)
-
         img_count = len(images)
 
         if text or img_count > 0:
@@ -284,12 +300,10 @@ def send_chat_via_browser(message):
 
             if not text_changed and not images_changed:
                 stable_count += 1
-                # For image requests, don't stabilize until we have at least 1 image
-                # OR we've waited at least 60s
                 if stable_count >= 4:
                     if is_image_request and img_count == 0 and (i + 1) * 2.5 < 60:
                         print(f"[*] Text stable but 0 images at {(i+1)*2.5}s, waiting...")
-                        stable_count = 0  # reset, keep waiting for image
+                        stable_count = 0
                     else:
                         print(f"[+] Stable at {(i+1)*2.5}s: {len(text)} chars, {img_count} images")
                         break
@@ -303,7 +317,7 @@ def send_chat_via_browser(message):
     # Extract final images
     final_images = extract_images_from_page(page)
 
-    # Take screenshot and save for fallback
+    # Take screenshot for fallback
     screenshot_bytes = None
     try:
         page.screenshot(path="/tmp/ddg_final.png", full_page=True)
@@ -315,7 +329,7 @@ def send_chat_via_browser(message):
     browser.close()
 
     # Build result
-    result = {"status": "success", "model": "gpt-5-mini"}
+    result = {"status": "success", "model": "gpt-5-mini", "proxy": proxy.split('@')[1] if '@' in proxy else proxy}
 
     # Clean text
     if last_text:
@@ -328,26 +342,23 @@ def send_chat_via_browser(message):
         if text:
             result["response"] = text
 
-    # Upload images to tmpfiles.org — network-captured first (full res), DOM fallback
+    # Upload images
     tmp_urls = []
 
-    # PRIORITY 1: Network-intercepted images (original quality, no canvas loss)
+    # PRIORITY 1: Network-intercepted images
     if captured_images:
         print(f"[*] Processing {len(captured_images)} network-intercepted image(s)...")
         for idx, img in enumerate(captured_images):
             ct = img["content_type"]
             ext = "png"
-            if "jpeg" in ct or "jpg" in ct:
-                ext = "jpg"
-            elif "webp" in ct:
-                ext = "webp"
-            elif "gif" in ct:
-                ext = "gif"
+            if "jpeg" in ct or "jpg" in ct: ext = "jpg"
+            elif "webp" in ct: ext = "webp"
+            elif "gif" in ct: ext = "gif"
             url = upload_to_tmpfiles(img["body"], f"ddg_image_{idx}.{ext}")
             if url:
                 tmp_urls.append(url)
 
-    # PRIORITY 2: DOM-extracted images (fallback)
+    # PRIORITY 2: DOM-extracted images
     if not tmp_urls and final_images:
         print(f"[*] No network images, falling back to {len(final_images)} DOM image(s)...")
         for idx, img in enumerate(final_images):
@@ -355,12 +366,10 @@ def send_chat_via_browser(message):
             img_type = img.get("type", "")
             try:
                 if img_type == "blob_bytes" and isinstance(img_data, list):
-                    # blob bytes from fetch()
                     img_bytes = bytes(img_data)
                     url = upload_to_tmpfiles(img_bytes, f"ddg_image_{idx}.png")
                     if url:
                         tmp_urls.append(url)
-
                 elif isinstance(img_data, str) and img_data.startswith("data:image/"):
                     header, b64 = img_data.split(",", 1)
                     ext = "png" if "png" in header else "jpg"
@@ -368,7 +377,6 @@ def send_chat_via_browser(message):
                     url = upload_to_tmpfiles(img_bytes, f"ddg_image_{idx}.{ext}")
                     if url:
                         tmp_urls.append(url)
-
                 elif img_type == "url" and isinstance(img_data, str) and img_data.startswith("http"):
                     print(f"[*] Downloading: {img_data[:100]}")
                     dl = requests.get(img_data, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
@@ -388,7 +396,7 @@ def send_chat_via_browser(message):
         result["images"] = tmp_urls
         result["type"] = "image"
 
-    # Fallback: if image request but no images extracted from DOM, upload screenshot
+    # Fallback: screenshot
     if is_image_request and not result.get("images") and screenshot_bytes and len(screenshot_bytes) > 5000:
         print("[*] No DOM images found, uploading screenshot as fallback...")
         url = upload_to_tmpfiles(screenshot_bytes, "ddg_screenshot.png")
