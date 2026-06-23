@@ -14,7 +14,7 @@
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const GH_PAT = process.env.GH_PAT;
-const GH_REPO = "zedxlab/ddg-api";
+const GH_REPO = "zedxgitaction/ddg-api";
 
 function randomId() {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
