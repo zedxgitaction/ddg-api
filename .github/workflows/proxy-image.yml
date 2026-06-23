@@ -41,3 +41,4 @@ jobs:
           IMAGE_PROMPT: ${{ inputs.prompt }}
           REQUEST_ID: ${{ inputs.request_id }}
         run: python scripts/proxy_image.py
+# force rescan
