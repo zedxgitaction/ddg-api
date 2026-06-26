@@ -9,9 +9,7 @@ import os
 import time
 import base64
 import random
-import io
 import requests
-from PIL import Image
 from cloakbrowser import launch
 
 UPSTASH_URL = os.environ["UPSTASH_REDIS_REST_URL"]
@@ -102,18 +100,13 @@ def upload_to_tmpfiles(image_bytes, filename="image.png"):
     return None
 
 
-def convert_gif_to_png(content, filename):
-    """Convert GIF bytes to PNG. Returns (png_bytes, new_filename) or original if not GIF."""
+def is_gif(filename, content=None):
+    """Check if file is a GIF by extension or content (magic bytes)."""
     if filename.endswith('.gif'):
-        try:
-            img = Image.open(io.BytesIO(content))
-            buf = io.BytesIO()
-            img.save(buf, format='PNG')
-            print(f"[*] Converted GIF → PNG: {filename}")
-            return buf.getvalue(), filename.replace('.gif', '.png')
-        except Exception as e:
-            print(f"[!] GIF conversion failed, keeping original: {e}")
-    return content, filename
+        return True
+    if content and len(content) > 4 and content[:3] == b'GIF':
+        return True
+    return False
 
 
 def click_any(page, selectors):
@@ -346,9 +339,10 @@ def upload_captured_images(captured_images, pre_existing_urls):
             ext = "png"
             if "jpeg" in ct or "jpg" in ct: ext = "jpg"
             elif "webp" in ct: ext = "webp"
-            elif "gif" in ct: ext = "gif"
-            content, fname = convert_gif_to_png(img["body"], f"ddg_image_{idx}.{ext}")
-            url = upload_to_tmpfiles(content, fname)
+            if is_gif(f"ddg_image_{idx}.{ext}", img["body"]):
+                print(f"[*] Skipping GIF (loading animation): {img['url'][:80]}")
+                continue
+            url = upload_to_tmpfiles(img["body"], f"ddg_image_{idx}.{ext}")
             if url:
                 tmp_urls.append(url)
     return tmp_urls
@@ -366,16 +360,20 @@ def upload_dom_images(images, pre_existing_urls):
         try:
             if img_type == "blob_bytes" and isinstance(img_data, list):
                 img_bytes = bytes(img_data)
-                content, fname = convert_gif_to_png(img_bytes, f"ddg_image_{idx}.png")
-                url = upload_to_tmpfiles(content, fname)
+                if is_gif(f"ddg_image_{idx}.png", img_bytes):
+                    print(f"[*] Skipping GIF blob (loading animation)")
+                    continue
+                url = upload_to_tmpfiles(img_bytes, f"ddg_image_{idx}.png")
                 if url:
                     tmp_urls.append(url)
             elif isinstance(img_data, str) and img_data.startswith("data:image/"):
                 header, b64 = img_data.split(",", 1)
-                ext = "png" if "png" in header else ("gif" if "gif" in header else "jpg")
+                ext = "png" if "png" in header else "jpg"
                 img_bytes = base64.b64decode(b64)
-                content, fname = convert_gif_to_png(img_bytes, f"ddg_image_{idx}.{ext}")
-                url = upload_to_tmpfiles(content, fname)
+                if is_gif(f"ddg_image_{idx}.{ext}", img_bytes):
+                    print(f"[*] Skipping GIF data URL (loading animation)")
+                    continue
+                url = upload_to_tmpfiles(img_bytes, f"ddg_image_{idx}.{ext}")
                 if url:
                     tmp_urls.append(url)
             elif img_type == "url" and isinstance(img_data, str) and img_data.startswith("http"):
